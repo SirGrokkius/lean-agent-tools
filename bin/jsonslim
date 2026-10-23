@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""jsonslim - shrink JSON / JSON Lines / API responses to the fields that matter.
+
+Paths: dot keys + [] for array items, e.g. items[].name, data.user.id; * = any one key, ** = any depth.
+-k keeps only matching paths (and their subtrees); -x drops them. Nulls/empty values are dropped by default.
+Secret-named keys (token, password, api_key, cookie, session, authorization...) and secret-looking strings -> [REDACTED].
+URL input: http(s) only; local/private hosts refused unless --allow-local (re-checked on redirects).
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys
+import json
+import argparse
+import fnmatch
+import collections
+import ipaddress
+import socket
+import urllib.request
+import urllib.parse
+import re
+
+SECRET_PATTERNS = [
+    re.compile(r'sk-[a-zA-Z0-9-_]{20,}'),
+    re.compile(r'ghp_[a-zA-Z0-9]{36}'),
+    re.compile(r'gh[pousr]_[a-zA-Z0-9_]{36,}'),
+    re.compile(r'xox[abp]-[a-zA-Z0-9-]{10,}'),
+    re.compile(r'nsec1[a-z0-9]{58}'),
+    re.compile(r'AKIA[0-9A-Z]{16}'),
+    re.compile(r'\b[a-fA-F0-9]{40,}\b'),  # HEX_RULE (disabled by --keep-hex)
+    re.compile(r'(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.])'),
+    re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY'),
+]
+
+SECRET_KEY = re.compile(r"(^|[_.-])(access_?token|refresh_?token|id_?token|auth_?token|token|secret|client_?secret|password|passwd|api_?key|apikey|authorization|auth|cookie|set-cookie|session(_?id)?|private_?key|nsec|bearer)$", re.I)
+
+def is_secret(key, value):
+    # secret-named keys are redacted unless the value is a plain number/bool (e.g. "tokens": 123 usage counters)
+    if isinstance(key, str) and SECRET_KEY.search(key) and not isinstance(value, (int, float, bool)) and value not in (None, ""):
+        return True
+    if isinstance(value, str):
+        for pattern in SECRET_PATTERNS:
+            if pattern.search(value):
+                return True
+    return False
+
+def truncate_string(s, max_len):
+    if len(s) > max_len:
+        return s[:max_len] + f"...(+{len(s) - max_len} chars)"
+    return s
+
+SEG = re.compile(r"\[\]|[^.\[\]]+")
+def segs(p): return SEG.findall(p)
+
+def _match(pat, path, prefix_ok):
+    """pat/path are segment lists. '*' = any one key, '**' = any number of segments.
+    prefix_ok: path may be an ancestor of something pat matches."""
+    if not pat: return not path
+    if not path: return prefix_ok
+    if pat[0] == "**":
+        return _match(pat[1:], path, prefix_ok) or _match(pat, path[1:], prefix_ok)
+    if pat[0] == "*" and path[0] != "[]" or pat[0] == path[0]:
+        return _match(pat[1:], path[1:], prefix_ok)
+    return False
+
+def _under(pat, path):
+    """path is pat itself or a descendant of a match of pat"""
+    for i in range(len(path) + 1):
+        if _match(pat, path[:i], False): return True
+    return False
+
+def should_keep(path, keep_patterns):
+    if not keep_patterns:
+        return True, False
+    ps = segs(path)
+    for kp in keep_patterns:
+        k = segs(kp)
+        if _match(k, ps, False): return True, True
+        if _under(k, ps): return True, False
+        if _match(k, ps, True): return True, False
+    return False, False
+
+def should_drop(path, drop_patterns):
+    if not drop_patterns:
+        return False
+    ps = segs(path)
+    return any(_under(segs(dp), ps) for dp in drop_patterns)
+
+def process_node(node, keep_patterns, drop_patterns, max_array, max_str, max_depth, current_depth, current_path):
+    if current_depth > max_depth and isinstance(node, (dict, list)):
+        if isinstance(node, dict):
+            return f"{{...{len(node)} keys}}"
+        else:
+            return f"[...{len(node)} items]"
+
+    if isinstance(node, dict):
+        new_dict = {}
+        for k, v in node.items():
+            path = f"{current_path}.{k}" if current_path else k
+            
+            if should_drop(path, drop_patterns):
+                continue
+            
+            is_kept, is_explicit = should_keep(path, keep_patterns)
+            if not is_kept:
+                continue
+
+            processed_v = process_node(v, keep_patterns, drop_patterns, max_array, max_str, max_depth, current_depth + 1, path)
+            
+            if is_secret(k, v):
+                processed_v = "[REDACTED]"
+
+            if not is_explicit and processed_v in [None, "", [], {}]:
+                continue
+            
+            new_dict[k] = processed_v
+        return new_dict
+
+    elif isinstance(node, list):
+        new_list = []
+        path = f"{current_path}[]"
+        
+        if should_drop(path, drop_patterns):
+            return []
+
+        is_kept, is_explicit = should_keep(path, keep_patterns)
+        if not is_kept:
+            return []
+
+        items_to_process = node[:max_array]
+        for item in items_to_process:
+            processed_item = process_node(item, keep_patterns, drop_patterns, max_array, max_str, max_depth, current_depth + 1, path)
+            if processed_item not in [None, "", [], {}]:
+                new_list.append(processed_item)
+        
+        if len(node) > max_array:
+            new_list.append(f"... +{len(node) - max_array} more items")
+        
+        return new_list
+
+    elif isinstance(node, str):
+        if is_secret(None, node):
+            return "[REDACTED]"
+        return truncate_string(node, max_str)
+    
+    return node
+
+def infer_schema(node, path="", schema=None):
+    if schema is None:
+        schema = collections.defaultdict(lambda: {"type": set(), "count": 0, "example": None})
+    
+    if node is None:
+        t = "null"
+    elif isinstance(node, bool):
+        t = "boolean"
+    elif isinstance(node, int):
+        t = "integer"
+    elif isinstance(node, float):
+        t = "float"
+    elif isinstance(node, str):
+        t = "string"
+    elif isinstance(node, dict):
+        t = "object"
+    elif isinstance(node, list):
+        t = "array"
+    else:
+        t = type(node).__name__
+
+    schema[path]["type"].add(t)
+    schema[path]["count"] += 1
+    if schema[path]["example"] is None:
+        if isinstance(node, (dict, list)):
+            pass
+        else:
+            key = path.rsplit(".", 1)[-1]
+            schema[path]["example"] = "[REDACTED]" if is_secret(key, node) or is_secret(None, node) else node
+
+    if isinstance(node, dict):
+        # dicts keyed by ids/urls/hashes (many keys) collapse to one "{*}" path so the schema stays small
+        dyn = len(node) > 40
+        for k, v in node.items():
+            kk = "{*}" if dyn else k
+            new_path = f"{path}.{kk}" if path else kk
+            infer_schema(v, new_path, schema)
+    elif isinstance(node, list):
+        new_path = f"{path}[]"
+        for item in node:
+            infer_schema(item, new_path, schema)
+            
+    return schema
+
+import os
+def allow_nets():
+    raw = os.environ.get("GROKKIUS_ALLOW_NETS", "").replace(",", " ").split()
+    f = os.path.expanduser("~/.config/grokkius-tools/allow-nets")
+    if os.path.isfile(f):
+        raw += [l.split("#")[0].strip() for l in open(f) if l.split("#")[0].strip()]
+    out = []
+    for r in raw:
+        try: out.append(ipaddress.ip_network(r, strict=False))
+        except ValueError: pass
+    return out
+
+class _Redir(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allow_local): self.allow_local = allow_local
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        check_url(newurl, self.allow_local)
+        return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+def fetch_url(url, allow_local=False):
+    check_url(url, allow_local)
+    op = urllib.request.build_opener(_Redir(allow_local))
+    req = urllib.request.Request(url, headers={"User-Agent": "jsonslim/1.0", "Accept": "application/json,*/*"})
+    with op.open(req, timeout=20) as resp:
+        return resp.read(20_000_000).decode("utf-8", "replace")
+
+def check_url(url, allow_local=False):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Refused non-http/https URL scheme: {parsed.scheme}")
+    
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Invalid URL hostname: {url}")
+    
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Failed to resolve hostname {hostname}: {e}")
+    
+    nets = allow_nets()
+    for _, _, _, _, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        
+        if not allow_local and not any(ip in n for n in nets):
+            if (ip.is_loopback or ip.is_private or ip.is_link_local or 
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                raise ValueError(f"Refused request to local/private/reserved IP: {ip} (hostname: {hostname}). Use --allow-local to override.")
+                
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="""Examples:
+  jsonslim response.json -k data.user.id -k items[].name
+  jsonslim - -x debug -x timestamp < response.json
+  jsonslim --schema api_response.json
+  jsonslim response.json --max-array 3 --max-str 50 --compact
+  jsonslim https://api.example.com/x -k "data.*.id"
+Exit: 0 ok, 1 read/parse error, 2 usage.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("file", nargs="?", default="-", help="JSON file, URL, or '-' for stdin")
+    parser.add_argument("-k", "--keep", action="append", help="keep only these paths (dot notation with [] for arrays)")
+    parser.add_argument("-x", "--drop", action="append", help="drop these paths")
+    parser.add_argument("--max-array", type=int, default=5, help="max array items to keep (default: 5)")
+    parser.add_argument("--max-str", type=int, default=200, help="max string length (default: 200)")
+    parser.add_argument("--depth", type=int, default=10, help="max depth (default: 10)")
+    parser.add_argument("--schema", action="store_true", help="print inferred schema instead")
+    parser.add_argument("--max-paths", type=int, default=300, help="max schema paths to print (default: 300)")
+    parser.add_argument("--keep-hex", action="store_true", help="don't redact bare 40+ char hex strings (e.g. public nostr ids/pubkeys, git SHAs); prefixed/named secrets are still redacted")
+    parser.add_argument("--compact", action="store_true", help="output compact JSON")
+    parser.add_argument("--allow-local", action="store_true", help="allow local/private IPs in URLs")
+
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        if e.code != 0:
+            sys.exit(2)
+        sys.exit(0)
+    if args.keep_hex:
+        SECRET_PATTERNS[:] = [p for p in SECRET_PATTERNS if p.pattern != r'\b[a-fA-F0-9]{40,}\b']
+
+    try:
+        if args.file.startswith("http://") or args.file.startswith("https://"):
+            input_data = fetch_url(args.file, args.allow_local)
+        elif args.file == "-":
+            input_data = sys.stdin.read()
+        else:
+            with open(args.file, "r") as f:
+                input_data = f.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not input_data.strip():
+        sys.exit(0)
+
+    try:
+        data = json.loads(input_data)
+    except json.JSONDecodeError:
+        try:
+            data = [json.loads(line) for line in input_data.strip().split("\n") if line.strip()]
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    input_bytes = len(input_data.encode("utf-8"))
+
+    if args.schema:
+        schema = infer_schema(data)
+        items = sorted(schema.items())
+        if len(items) > args.max_paths:
+            print(f"jsonslim: schema has {len(items)} paths, showing {args.max_paths} (raise --max-paths)", file=sys.stderr)
+        for path, info in items[:args.max_paths]:
+            types = "/".join(sorted(list(info["type"])))
+            example = info["example"]
+            if isinstance(example, str):
+                example = f'"{truncate_string(example, 50)}"'
+            print(f"{path if path else '(root)'}: {types} (count: {info['count']}, example: {example})")
+        print(f"jsonslim: {len(schema)} paths; schema {sum(len(p) for p in schema)+60*len(schema)} B approx vs {input_bytes} B input", file=sys.stderr)
+        sys.exit(0)
+
+    output_data = process_node(data, args.keep, args.drop, args.max_array, args.max_str, args.depth, 0, "")
+
+    if args.compact:
+        out_str = json.dumps(output_data, separators=(',', ':'))
+    else:
+        out_str = json.dumps(output_data, indent=1)
+
+    print(out_str)
+
+    output_bytes = len(out_str.encode("utf-8"))
+    reduction = 0
+    if input_bytes > 0:
+        reduction = (input_bytes - output_bytes) / input_bytes * 100
+    
+    print(f"jsonslim: {input_bytes} bytes -> {output_bytes} bytes (-{reduction:.1f}%)", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

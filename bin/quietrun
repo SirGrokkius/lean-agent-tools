@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""quietrun - wrap a cron/routine job and only emit output when something changed or failed.
+An agent reading routine logs then sees nothing on the 95% of runs where nothing happened.
+
+Usage:
+  quietrun [--name N] [--ignore REGEX]... [--diff] [--heartbeat 24h] [--keep-volatile] -- CMD ARGS...
+  quietrun --reset --name N
+
+  --name N         state name (default: sha1 of the command line)
+  --ignore RE      drop matching lines before comparing (repeatable), e.g. --ignore '^took '
+  --diff           on change, print a unified diff vs the last run instead of the full output
+  --heartbeat T    if unchanged for longer than T (s/m/h/d), print one line 'quietrun: N unchanged since ...'
+  --keep-volatile  compare raw output (default: timestamps, durations, hex ids, PIDs are normalised for comparing)
+Behaviour:
+  exit 0 + same (normalised) output as last run  -> prints nothing, exit 0
+  exit 0 + changed output                         -> prints output (or --diff), exit 0
+  non-zero exit                                   -> always prints output + 'quietrun: exit N', passes exit code
+State: ~/.cache/quietrun/<name>.json (hash, last output capped at 200 KB, time). Mode 600.
+Secret-looking strings are redacted in what is printed and stored.
+CMD runs without a shell. Example cron line:
+  */15 * * * * quietrun --name dvm --ignore 'checked at' -- /home/me/bin/check-dvm >> ~/alerts.log
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, re, json, time, hashlib, subprocess, difflib, datetime
+D = os.path.expanduser(os.environ.get("QUIETRUN_DIR", "~/.cache/quietrun"))
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+)|\b[A-Fa-f0-9]{40,}\b)")
+def redact(s): return SECRET.sub("[REDACTED]", s)
+VOL = [(re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d(\.\d+)?)?(Z|[+-]\d\d:?\d\d)?"), "<TS>"),
+       (re.compile(r"\b\d\d:\d\d(:\d\d(\.\d+)?)?\b"), "<T>"),
+       (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w* \w{3} +\d+\b"), "<DATE>"),
+       (re.compile(r"\b\d+(\.\d+)?\s?(ms|s|sec|secs|seconds|m|min)\b"), "<DUR>"),
+       (re.compile(r"\b[0-9a-f]{8,}\b"), "<HEX>"),
+       (re.compile(r"\bpid[ =:]*\d+", re.I), "pid <N>")]
+def normv(s):
+    for rx, rep in VOL: s = rx.sub(rep, s)
+    return s
+def dur(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", s)
+    if not m: raise ValueError(f"bad duration {s}")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+def main(a):
+    name, ign, diff, hb, keepv, reset, cmd = None, [], False, None, False, False, None
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--name": name = a.pop(0)
+        elif x == "--ignore": ign.append(re.compile(a.pop(0)))
+        elif x == "--diff": diff = True
+        elif x == "--heartbeat": hb = dur(a.pop(0))
+        elif x == "--keep-volatile": keepv = True
+        elif x == "--reset": reset = True
+        elif x == "--": cmd = a; break
+        else: print(f"quietrun: unknown arg {x}", file=sys.stderr); return 2
+    if name is not None and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", name) or name in (".", ".."):
+        print("quietrun: --name must be [A-Za-z0-9_.-]", file=sys.stderr); return 2
+    if not name:
+        if not cmd: print(__doc__); return 2
+        name = hashlib.sha1("\0".join(cmd).encode()).hexdigest()[:16]
+    os.makedirs(D, mode=0o700, exist_ok=True)
+    sp = os.path.join(D, name + ".json")
+    if reset:
+        if os.path.exists(sp): os.remove(sp)
+        print(f"quietrun: reset {name}"); return 0
+    if not cmd: print("quietrun: need -- CMD", file=sys.stderr); return 2
+    try: r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except FileNotFoundError: print(f"quietrun: command not found: {cmd[0]}"); return 127
+    out = redact(r.stdout.decode("utf-8", "replace"))
+    lines = [l for l in out.splitlines() if not any(p.search(l) for p in ign)]
+    norm = lines if keepv else [normv(l) for l in lines]
+    h = hashlib.sha256("\n".join(l.rstrip() for l in norm).encode()).hexdigest()
+    prev = {}
+    if os.path.exists(sp):
+        try: prev = json.load(open(sp))
+        except (OSError, ValueError): prev = {}
+    now = time.time()
+    changed = prev.get("hash") != h
+    st = {"hash": h, "out": out[-200_000:], "t": now, "since": now if changed else prev.get("since", now), "hb": prev.get("hb", 0), "runs": prev.get("runs", 0) + 1}
+    if r.returncode != 0:
+        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+        print(f"quietrun: {name} exit {r.returncode}")
+    elif changed:
+        if diff and prev.get("out") is not None:
+            d = list(difflib.unified_diff(prev["out"].splitlines(), out.splitlines(), "before", "now", lineterm="", n=1))
+            print("\n".join(d) if d else "quietrun: only volatile/ignored text changed")
+        else:
+            sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+            if not prev: print(f"quietrun: {name} first run (baseline saved)")
+    elif hb and now - max(st["since"], st["hb"]) > hb:
+        print(f"quietrun: {name} unchanged since {datetime.datetime.fromtimestamp(st['since']):%Y-%m-%d %H:%M} ({st['runs']} runs)")
+        st["hb"] = now
+    tmp = sp + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh: json.dump(st, fh)
+    os.replace(tmp, sp)
+    return r.returncode
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except ValueError as e: print(f"quietrun: {e}", file=sys.stderr); sys.exit(2)
+    except BrokenPipeError: sys.exit(0)

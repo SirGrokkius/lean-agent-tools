@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""since - show only what changed in files since the last look.
+  since [--name default] FILE...     since --reset [--name default]
+State ($SINCE_STATE or ~/.cache/since/<name>.json, mode 600) holds ONLY hashes and counts, never file content:
+  CSV  -> header + {first-column key: sha256(row)}  -> prints new/changed rows (current values)
+  text -> line count + sha256 of each line          -> prints appended lines, or on rewrite the new lines not seen before
+Output is redacted and capped at 30 lines per file. (Grokky fixes 2026-10-22: no content copies, safe --reset.)"""
+import argparse, csv, hashlib, io, json, os, pathlib, re, sys
+SECRET = re.compile(r'nsec1[0-9A-Za-z]{10,}|\bsk-[A-Za-z0-9_-]{6,}|\bgh[pousr]_[A-Za-z0-9]{10,}|\bxox[baprs]-[A-Za-z0-9-]+|\b(api_key|token|secret|password|authorization)\s*[:=]\s*\S+|\b[0-9a-fA-F]{40,}\b', re.I)
+CAP = 30
+def safe(s): return SECRET.sub('[REDACTED]', s)
+def h(s): return hashlib.sha256(s.encode('utf-8', 'replace')).hexdigest()[:20]
+def snap(path):
+    p = pathlib.Path(path)
+    if not p.is_file(): return None, None
+    b = p.read_bytes(); text = b.decode('utf-8', 'replace')
+    meta = {'size': len(b), 'mtime': p.stat().st_mtime, 'sha256': hashlib.sha256(b).hexdigest(), 'lines': len(text.splitlines())}
+    if path.lower().endswith('.csv'):
+        try:
+            r = csv.reader(io.StringIO(text)); hdr = next(r, None)
+            if hdr:
+                meta['header'] = hdr; meta['rows'] = {}
+                for row in r:
+                    if row: meta['rows'][row[0]] = h('\x1f'.join(row))
+                return meta, text
+        except csv.Error: pass
+    meta['lh'] = [h(l) for l in text.splitlines()]
+    return meta, text
+def main():
+    p = argparse.ArgumentParser(description='Show file changes since previous look (stores hashes only)')
+    p.add_argument('files', nargs='*'); p.add_argument('--name', default='default'); p.add_argument('--reset', action='store_true')
+    p.add_argument('--state', default=os.getenv('SINCE_STATE', '')); p.add_argument('--state-dir', default=os.getenv('SINCE_STATE_DIR', os.path.expanduser('~/.cache/since')))
+    a = p.parse_args()
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', a.name): p.error('bad --name')
+    state = pathlib.Path(a.state) if a.state else pathlib.Path(a.state_dir) / (a.name + '.json')
+    if a.reset:
+        if state.exists():
+            try: ok = json.loads(state.read_text()).get('_since') == 1
+            except Exception: ok = False
+            if not ok: print(f'refusing to delete {state}: not a since state file', file=sys.stderr); return 2
+            state.unlink()
+        print('state reset'); return 0
+    if not a.files: p.error('provide FILE... or --reset')
+    state.parent.mkdir(parents=True, exist_ok=True)
+    try: old = json.loads(state.read_text()) if state.exists() else {}
+    except Exception: old = {}
+    files_old = old.get('files', {}); first = not files_old; cur = dict(files_old)
+    for name in a.files:
+        meta, text = snap(name); prev = files_old.get(name)
+        if meta is None:
+            if prev: print(f'{name}: missing'); cur.pop(name, None)
+            elif not first: print(f'{name}: missing')
+            continue
+        cur[name] = meta
+        if first: continue
+        if not prev: print(f'{name}: new file ({meta["lines"]} lines)'); continue
+        if prev.get('sha256') == meta['sha256']: print(f'{name}: unchanged'); continue
+        if 'rows' in meta and prev.get('header') == meta['header']:
+            rows = list(csv.reader(io.StringIO(text)))[1:]
+            pr = prev.get('rows', {}); add, chg = [], []
+            for row in rows:
+                if not row: continue
+                k = row[0]
+                if k not in pr: add.append(row)
+                elif pr[k] != h('\x1f'.join(row)): chg.append(row)
+            gone = len(set(pr) - set(meta['rows']))
+            print(f'{name}: +{len(add)} rows, {len(chg)} changed' + (f', -{gone} removed' if gone else ''))
+            if add or chg:
+                out = io.StringIO(); w = csv.writer(out, lineterminator='\n'); w.writerow(meta['header'])
+                for r in (add + chg)[:CAP]: w.writerow([safe(c)[:200] for c in r])
+                print(out.getvalue(), end='')
+                if len(add + chg) > CAP: print(f'... {len(add + chg) - CAP} more rows')
+        else:
+            lines = text.splitlines(); plh = prev.get('lh')
+            if plh is None: print(f'{name}: changed (format changed; baseline reset)'); continue
+            n = len(plh)
+            if len(lines) >= n and [h(l) for l in lines[:n]] == plh:
+                new = lines[n:]; print(f'{name}: +{len(new)} lines')
+            else:
+                seen = set(plh); new = [l for l in lines if h(l) not in seen]
+                print(f'{name}: rewritten ({n} -> {len(lines)} lines, {len(new)} new/changed)')
+            for l in new[:CAP]: print(safe(l)[:300])
+            if len(new) > CAP: print(f'... {len(new) - CAP} more lines')
+    tmp = state.with_suffix('.tmp'); tmp.write_text(json.dumps({'_since': 1, 'files': cur})); os.chmod(tmp, 0o600); tmp.replace(state)
+    if first: print(f'baseline recorded ({len(a.files)} files)')
+    return 0
+if __name__ == '__main__': sys.exit(main())

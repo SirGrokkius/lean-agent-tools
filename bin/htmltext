@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""htmltext - fetch a web page (or read an HTML file/stdin) and print only the main readable text.
+
+Usage:
+  htmltext URL [--budget CHARS] [--links] [--title-only] [--allow-local] [--timeout S]
+  htmltext FILE.html | -          (local file or stdin; no network)
+
+  --budget N     max characters printed (default 6000; 0 = no cap). Cuts at a paragraph edge.
+  --links        append up to 20 in-content links as [n] url
+  --allow-local  allow loopback / private-network hosts (refused by default)
+  Env GROKKIUS_ALLOW_NETS / file ~/.config/grokkius-tools/allow-nets: extra CIDRs to allow
+                 (e.g. 198.18.0.0/15 behind a fake-IP DNS proxy). Loopback stays refused unless listed.
+  --stats        print a stats line to stderr: raw bytes -> text chars (-P%)
+
+What is removed: <script> <style> <nav> <header> <footer> <aside> <form> <noscript> <svg> <iframe>,
+and elements whose id/class/role look like nav, menu, sidebar, cookie, banner, ad, promo, share,
+comment, footer, breadcrumb, subscribe, popup, modal. Main content is taken from <article>/<main>
+(or role=main) when present, else the <body> block with the most paragraph text.
+Only http(s) URLs. file://, ftp:// etc. are refused. Secret-looking strings are redacted.
+
+Examples:
+  htmltext https://example.com/post --budget 3000
+  curl -s https://site/page | htmltext - --stats
+Exit codes: 0 ok, 1 no readable text (JS-only page), 2 usage / refused URL / fetch error.
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, re, os, socket, ipaddress, urllib.request, urllib.parse, urllib.error
+from html.parser import HTMLParser
+
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+)|\b[A-Fa-f0-9]{40,}\b)")
+def redact(s): return SECRET.sub("[REDACTED]", s)
+
+DROP_TAGS = {"script", "style", "nav", "header", "footer", "aside", "form", "noscript", "svg", "iframe", "button", "select", "template", "canvas"}
+VOID = {"br", "img", "hr", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr", "param"}
+BLOCK = {"p", "div", "section", "article", "main", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "tr", "table", "dd", "dt", "figcaption", "br", "hr", "td", "th"}
+JUNK = re.compile(r"(^|[\s_-])(nav|navbar|menu|sidebar|cookie|consent|banner|ads?|advert|promo|share|social|comments?|footer|breadcrumbs?|subscribe|newsletter|popup|modal|related|sponsor)([\s_-]|$)", re.I)
+
+class P(HTMLParser):
+    def __init__(s):
+        super().__init__(convert_charrefs=True)
+        s.stack = []          # (tag, dropping)
+        s.drop = 0
+        s.blocks = []         # list of [container_key, text]
+        s.cur = []
+        s.title = ""; s.in_title = False
+        s.container = "body"; s.cstack = []
+        s.links = []; s.href = None
+    def flush(s):
+        t = re.sub(r"\s+", " ", "".join(s.cur)).strip()
+        if t: s.blocks.append((s.container, t))
+        s.cur = []
+    def handle_starttag(s, tag, attrs):
+        a = dict(attrs)
+        if tag == "title": s.in_title = True
+        if tag in VOID:
+            if tag == "br" and not s.drop: s.flush()
+            return
+        marker = " ".join(filter(None, [a.get("id"), a.get("class"), a.get("role")]))
+        dropping = tag in DROP_TAGS or bool(marker and JUNK.search(marker)) or a.get("aria-hidden") == "true" or "display:none" in (a.get("style") or "").replace(" ", "")
+        if a.get("role") == "main" or tag in ("main", "article", "html", "body"):
+            dropping = False
+        s.stack.append((tag, dropping))
+        if dropping: s.drop += 1
+        if not s.drop:
+            if tag in BLOCK: s.flush()
+            if tag in ("main", "article") or a.get("role") == "main":
+                s.cstack.append(s.container); s.container = f"{tag}#{len(s.cstack)}"
+            if tag in ("h1", "h2", "h3"): s.cur.append("## " if tag != "h1" else "# ")
+            if tag == "li": s.cur.append("- ")
+            if tag == "a" and a.get("href", "").startswith(("http://", "https://")): s.href = a["href"]
+    def handle_endtag(s, tag):
+        if tag == "title": s.in_title = False
+        if tag in VOID: return
+        # pop to matching tag (tolerate bad HTML)
+        for i in range(len(s.stack) - 1, -1, -1):
+            if s.stack[i][0] == tag:
+                for t, d in s.stack[i:][::-1]:
+                    if not s.drop and t in BLOCK: s.flush()
+                    if d: s.drop -= 1
+                    elif not s.drop and (t in ("main", "article")) and s.cstack:
+                        s.flush(); s.container = s.cstack.pop()
+                del s.stack[i:]
+                break
+        if tag == "a" and s.href:
+            if len(s.links) < 200: s.links.append(s.href)
+            s.href = None
+    def handle_data(s, d):
+        if s.in_title: s.title += d; return
+        if not s.drop: s.cur.append(d)
+
+def allow_nets():
+    """Extra CIDRs that are OK even though private, e.g. a fake-IP DNS proxy (198.18.0.0/15).
+    From env GROKKIUS_ALLOW_NETS (comma-separated) or ~/.config/grokkius-tools/allow-nets (one per line)."""
+    raw = os.environ.get("GROKKIUS_ALLOW_NETS", "").replace(",", " ").split()
+    f = os.path.expanduser("~/.config/grokkius-tools/allow-nets")
+    if os.path.isfile(f):
+        raw += [l.split("#")[0].strip() for l in open(f) if l.split("#")[0].strip()]
+    out = []
+    for r in raw:
+        try: out.append(ipaddress.ip_network(r, strict=False))
+        except ValueError: pass
+    return out
+
+def safe_url(u, allow_local):
+    p = urllib.parse.urlparse(u)
+    if p.scheme not in ("http", "https"): raise ValueError(f"refused scheme '{p.scheme}' (only http/https)")
+    if not p.hostname: raise ValueError("no host")
+    if allow_local: return
+    try: infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80))
+    except socket.gaierror as e: raise ValueError(f"DNS failed: {e}")
+    nets = allow_nets()
+    for inf in infos:
+        ip = ipaddress.ip_address(inf[4][0].split("%")[0])
+        if any(ip in n for n in nets): continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            raise ValueError(f"refused local/private address {ip} (use --allow-local)")
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(s, allow_local): s.allow_local = allow_local
+    def redirect_request(s, req, fp, code, msg, hdrs, newurl):
+        safe_url(newurl, s.allow_local)   # re-check every redirect hop
+        return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+def fetch(u, allow_local, timeout):
+    safe_url(u, allow_local)
+    op = urllib.request.build_opener(NoRedirect(allow_local))
+    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (htmltext/1.0)", "Accept": "text/html,*/*"})
+    with op.open(req, timeout=timeout) as r:
+        data = r.read(5_000_001)
+        cs = r.headers.get_content_charset() or "utf-8"
+    if len(data) > 5_000_000: data = data[:5_000_000]
+    return data.decode(cs, "replace")
+
+def extract(html):
+    p = P(); p.feed(html); p.close(); p.flush()
+    by = {}
+    for c, t in p.blocks: by.setdefault(c, []).append(t)
+    mains = [k for k in by if k != "body"]
+    if mains:
+        key = max(mains, key=lambda k: sum(len(t) for t in by[k]))
+    else:
+        key = "body"
+    blocks = by.get(key, [])
+    # drop tiny link-ish fragments that repeat (menus that slipped through)
+    seen = set(); out = []
+    for t in blocks:
+        k = t.lower()
+        if k in seen: continue
+        seen.add(k); out.append(t)
+    return re.sub(r"\s+", " ", p.title).strip(), out, p.links
+
+def main(a):
+    budget, links, allow, timeout, stats, src = 6000, False, False, 20, False, None
+    title_only = False
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--budget": budget = int(a.pop(0))
+        elif x == "--links": links = True
+        elif x == "--allow-local": allow = True
+        elif x == "--timeout": timeout = float(a.pop(0))
+        elif x == "--stats": stats = True
+        elif x == "--title-only": title_only = True
+        elif x.startswith("--"): print(f"htmltext: unknown arg {x}", file=sys.stderr); return 2
+        elif src is None: src = x
+        else: print("htmltext: one source only", file=sys.stderr); return 2
+    if src is None: print(__doc__); return 2
+    try:
+        if src == "-": html = sys.stdin.buffer.read().decode("utf-8", "replace")
+        elif "://" in src: html = fetch(src, allow, timeout)
+        elif os.path.isfile(src): html = open(src, encoding="utf-8", errors="replace").read()
+        else: print(f"htmltext: not a file or http(s) URL: {src}", file=sys.stderr); return 2
+    except (ValueError, urllib.error.URLError, OSError) as e:
+        print(f"htmltext: {redact(str(e))}", file=sys.stderr); return 2
+    title, blocks, lk = extract(html)
+    if title_only: print(redact(title)); return 0
+    if not blocks:
+        print(f"htmltext: no readable text found (JS-rendered page or blocked?) title={redact(title)!r}", file=sys.stderr)
+        return 1
+    out = ([f"TITLE: {title}"] if title else []) + blocks
+    text = "\n".join(out)
+    if budget and len(text) > budget:
+        cut = text.rfind("\n", 0, budget)
+        text = text[: cut if cut > budget // 2 else budget].rstrip() + f"\n[htmltext: cut at {budget} chars of {len(chr(10).join(out))}]"
+    if links and lk:
+        uniq = list(dict.fromkeys(lk))[:20]
+        text += "\nLINKS:\n" + "\n".join(f"[{i+1}] {u}" for i, u in enumerate(uniq))
+    print(redact(text))
+    if stats:
+        rb = len(html.encode()); tb = len(text.encode())
+        print(f"htmltext: {rb} B html -> {tb} B text (-{100 - 100 * tb // max(rb, 1)}%)", file=sys.stderr)
+    return 0
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)

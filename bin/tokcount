@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""tokcount - estimate tokens of files, folders or stdin BEFORE an AI reads them; warn over budget, suggest cuts.
+
+Usage:
+  tokcount [PATH ...|-] [--budget N] [--top K] [--json] [--ext py,md] [--ratio R]
+
+  PATH        files or dirs (default .). '-' = stdin. Skips binaries, .git, node_modules, __pycache__, .venv,
+              and files > 50 MB (counted by size only).
+  --budget N  token budget; if the total is over it: print 'OVER BUDGET by X' + cut suggestions, exit 1
+  --top K     rows to show (default 10)
+  --json      machine-readable output (same exit codes)
+  --ext a,b   only these extensions
+  --ratio R   override chars-per-token for everything
+Estimate = chars / ratio, ratio by kind: prose 3.4, code 3.2, data (json/csv/minified/logs) 3.0.
+Calibrated 2026 on real files against the o200k tokenizer (see SAVINGS.md); 47 real files: total within 2%, single files 0.68-1.32x.
+No AI, no network. Exit: 0 ok / under budget, 1 over budget, 2 usage error.
+
+Examples:
+  tokcount src/ --budget 8000
+  some-cmd | tokcount -
+  tokcount notes/ --ext md --json
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, json, re, collections
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".tox", "dist", "build"}
+CODE = {".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".h", ".cpp", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".sh", ".bash", ".swift", ".kt", ".cs", ".lua", ".sql", ".css", ".scss", ".html", ".htm", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+DATA = {".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".log", ".lock"}
+PROSE = {".md", ".txt", ".rst", ".adoc", ""}
+RATIO = {"prose": 3.4, "code": 3.2, "data": 3.0}
+MAXREAD = 50 * 1024 * 1024
+
+def classify(path, sample):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in DATA or path.endswith(".min.js"): return "data"
+    if ext in CODE: return "code"
+    if ext in PROSE and ext:
+        return "prose"
+    if not sample: return "prose"
+    if sample.lstrip()[:1] in (b"{", b"["): return "data"
+    if sample.startswith(b"#!"): return "code"
+    punct = sum(1 for c in sample if c in b"{}[]();:,<>/\\'\"+-=_|&*$#")
+    return "code" if punct / len(sample) > 0.12 else "prose"
+
+def files(paths, exts):
+    for p in paths:
+        if p == "-": yield ("-", None); continue
+        if os.path.isfile(p): yield (p, os.path.getsize(p)); continue
+        if not os.path.isdir(p): print(f"tokcount: skip missing {p}", file=sys.stderr); continue
+        for root, ds, fs in os.walk(p):
+            ds[:] = sorted(d for d in ds if d not in SKIP_DIRS)
+            for f in sorted(fs):
+                fp = os.path.join(root, f)
+                if exts and os.path.splitext(f)[1].lower().lstrip(".") not in exts: continue
+                if os.path.islink(fp) or not os.path.isfile(fp): continue
+                try: yield (fp, os.path.getsize(fp))
+                except OSError: continue
+
+def main(a):
+    paths, budget, top, js, exts, ratio = [], None, 10, False, None, None
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--budget": budget = int(a.pop(0))
+        elif x == "--top": top = int(a.pop(0))
+        elif x == "--json": js = True
+        elif x == "--ext": exts = {e.strip().lstrip(".").lower() for e in a.pop(0).split(",") if e.strip()}
+        elif x == "--ratio": ratio = float(a.pop(0))
+        elif x.startswith("--"): print(f"tokcount: unknown arg {x}", file=sys.stderr); return 2
+        else: paths.append(x)
+    paths = paths or ["."]
+    rows = []
+    for p, size in files(paths, exts):
+        if p == "-": data = sys.stdin.buffer.read(); size = len(data)
+        elif size > MAXREAD:
+            rows.append({"path": p, "kind": "data", "bytes": size, "lines": None, "tokens": int(size / (ratio or 2.8)), "dup": 0.0}); continue
+        else:
+            try:
+                with open(p, "rb") as f: data = f.read()
+            except OSError: continue
+        if b"\x00" in data[:8192]: continue
+        kind = classify(p, data[:8192])
+        text = data.decode("utf-8", "replace")
+        lines = text.splitlines()
+        nonblank = [l.strip() for l in lines if l.strip()]
+        dup = 1 - len(set(nonblank)) / len(nonblank) if nonblank else 0.0
+        rows.append({"path": p, "kind": kind, "bytes": len(data), "lines": len(lines), "tokens": int(len(text) / (ratio or RATIO[kind])), "dup": round(dup, 2)})
+    rows.sort(key=lambda r: -r["tokens"])
+    total = sum(r["tokens"] for r in rows)
+    over = budget is not None and total > budget
+    sugg = []
+    if over:
+        need = total - budget; acc = 0
+        for r in rows:                       # largest first until under budget
+            if acc >= need: break
+            sugg.append(f"drop or summarise {r['path']} (-{r['tokens']} tok)"); acc += r["tokens"]
+        for r in rows[:50]:
+            ext = os.path.splitext(r["path"])[1].lower()
+            if r["dup"] > 0.30 and r["tokens"] > 500: sugg.append(f"{r['path']}: {int(r['dup']*100)}% duplicate lines -> logdiff / squeeze")
+            if ext in (".json", ".jsonl", ".ndjson") and r["tokens"] > 500: sugg.append(f"{r['path']}: JSON -> jsonslim --schema, then jsonslim -k <paths>")
+            elif ext in (".csv", ".tsv") and r["tokens"] > 500: sugg.append(f"{r['path']}: CSV -> csvq (filter rows/cols) or head")
+            elif ext == ".log" and r["tokens"] > 500: sugg.append(f"{r['path']}: log -> tail -n 200 | logdiff")
+    if js:
+        print(json.dumps({"files": rows[:top], "n_files": len(rows), "total_tokens": total, "total_bytes": sum(r["bytes"] for r in rows),
+                          "budget": budget, "over_by": (total - budget) if over else 0, "suggestions": sugg}, indent=1))
+    else:
+        print(f"{'TOKENS':>9} {'LINES':>7} {'BYTES':>10} KIND   PATH")
+        for r in rows[:top]:
+            print(f"{r['tokens']:>9} {r['lines'] if r['lines'] is not None else '?':>7} {r['bytes']:>10} {r['kind']:<6} {r['path']}")
+        if len(rows) > top: print(f"{'':>9} ... {len(rows) - top} more files")
+        print(f"{total:>9} {'':>7} {sum(r['bytes'] for r in rows):>10} TOTAL  ({len(rows)} files, ~{total/1000:.1f}k tokens)")
+        if over:
+            print(f"OVER BUDGET by {total - budget} tokens (budget {budget})")
+            for s in sugg: print("  - " + s)
+        elif budget is not None: print(f"under budget ({budget - total} tokens to spare)")
+    return 1 if over else 0
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)
+    except ValueError as e: print(f"tokcount: {e}", file=sys.stderr); sys.exit(2)

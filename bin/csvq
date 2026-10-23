@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import argparse,csv,json,re,sys
+SECRET=re.compile(r'nsec1[0-9A-Za-z]{10,}|\bsk-[A-Za-z0-9_-]{6,}|\bgh[pousr]_[A-Za-z0-9]{10,}|\bxox[baprs]-[A-Za-z0-9-]+|\b(api_key|token|secret|password|authorization)\s*[:=]\s*\S+|\b[0-9a-fA-F]{40,}\b',re.I)
+def safe(v): return SECRET.sub('[REDACTED]',str(v))
+def main():
+ p=argparse.ArgumentParser(description='Query CSV data with streaming row reads')
+ p.add_argument('file');p.add_argument('filters',nargs='*');p.add_argument('-c','--columns');p.add_argument('-n',type=int,default=20);p.add_argument('--count',action='store_true');p.add_argument('--sort');p.add_argument('--last',type=int);p.add_argument('--schema',action='store_true');p.add_argument('--json',action='store_true');p.add_argument('--csv',action='store_true');p.add_argument('--full',action='store_true')
+ a=p.parse_args()
+ try:
+  with open(a.file,newline='',encoding='utf-8-sig') as f:
+   reader=csv.DictReader(f); headers=reader.fieldnames or []
+   if a.schema:
+    rows=list(reader);print('columns:',', '.join(headers));print('rows:',len(rows))
+    for h in headers: print(f'{h}: '+json.dumps([safe(r.get(h,'')) for r in rows[:2]],ensure_ascii=False))
+    return 0
+   tests=[]
+   for x in a.filters:
+    m=re.fullmatch(r'([^!<>~=]+)(!=|=|~|>|<)(.*)',x)
+    if not m:p.error('invalid filter: '+x)
+    col,op,val=m.groups()
+    if col not in headers:p.error('unknown column: '+col)
+    tests.append((col,op,val))
+   rows=[]
+   for row in reader:
+    ok=True
+    for col,op,val in tests:
+     v=row.get(col,'') or ''
+     try:
+      if op=='=': good=v.casefold()==val.casefold()
+      elif op=='!=':good=v.casefold()!=val.casefold()
+      elif op=='~':good=bool(re.search(val,v,re.I))
+      elif op=='>':good=float(v)>float(val)
+      else:good=float(v)<float(val)
+     except (ValueError,re.error):good=False
+     if not good:ok=False;break
+    if ok: rows.append(row)
+ except (OSError,csv.Error) as e:print('csvq:',e,file=sys.stderr);return 2
+ if a.sort:
+  col,*direction=a.sort.split(':',1)
+  if col not in headers:p.error('unknown sort column: '+col)
+  def key(r):
+   try:return (0,float(r.get(col,'') or 0))
+   except ValueError:return (1,(r.get(col,'') or '').casefold())
+  rows.sort(key=key,reverse=bool(direction and direction[0].lower()=='desc'))
+ if a.last is not None: rows=rows[-max(0,a.last):]
+ if a.count:print(len(rows));return 0 if rows else 1
+ cols=[x.strip() for x in a.columns.split(',')] if a.columns else headers
+ if any(c not in headers for c in cols):p.error('unknown output column')
+ if a.json:
+  print(json.dumps([{c:(safe(r.get(c,'')) if a.full else safe(r.get(c,'') or '')[:120]) for c in cols} for r in rows[:max(0,a.n)]],ensure_ascii=False))
+ elif a.csv:
+  w=csv.DictWriter(sys.stdout,fieldnames=cols,lineterminator='\n');w.writeheader()
+  for r in rows[:max(0,a.n)]:w.writerow({c:(safe(r.get(c,'')) if a.full else safe(r.get(c,'') or '')[:120]) for c in cols})
+ else:
+  vals=[[(safe(r.get(c,'')) if a.full else safe(r.get(c,'') or '')[:120]) for c in cols] for r in rows[:max(0,a.n)]]
+  widths=[min(120,max([len(c)]+[len(row[i]) for row in vals])) for i,c in enumerate(cols)]
+  print(' | '.join(c.ljust(widths[i]) for i,c in enumerate(cols)));print('-+-'.join('-'*w for w in widths))
+  for row in vals:print(' | '.join(v.ljust(widths[i]) for i,v in enumerate(row)))
+ return 0 if rows else 1
+if __name__=='__main__':sys.exit(main())

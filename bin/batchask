@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""batchask - send many small questions to a (free) AI in ONE call and split the answers back out.
+N questions -> 1 request instead of N (saves N-1 calls of rate limit / quota and the repeated system prompt).
+
+Usage:
+  batchask [FILE|-] [--backend "CMD ARGS"] [--style "short"] [--json] [--retry-missing] [--max-q 40] [--dry-run]
+
+  FILE            questions, one per line (blank lines and lines starting with # ignored),
+                  or blocks separated by a line '---' for multi-line questions. '-' or no FILE = stdin.
+  --backend CMD   command that takes the prompt as its LAST argument and prints the answer
+                  (default: $BATCHASK_BACKEND, else the first found of 'ai-tier ask2', 'ai-ask llm7',
+                  'llm' (simonw/llm), 'ollama run llama3.2'). Split with shlex, run WITHOUT a shell.
+  --stdin-prompt  give the prompt on stdin to the backend instead of as an argument
+  --style S       answer style hint (default: "concise, 1-3 sentences, say 'unknown' if unsure")
+  --json          print [{"n":1,"q":...,"a":...}, ...]
+  --retry-missing ask unanswered questions again one at a time (costs extra calls; off by default)
+  --max-q N       max questions per call (default 40; more are sent in chunks)
+  --dry-run       print the combined prompt and exit (0 calls)
+Safety: refuses to send if any question contains a secret-looking string (keyless providers may log prompts).
+Answers are split on '### A<n>' markers; anything the model fails to mark is reported as MISSING.
+A chunk with no parsable answers is retried once as a whole.
+Answers are only as good as the backend model: check facts that matter.
+Exit: 0 all answered, 1 some missing, 2 usage/backend error.
+
+Examples:
+  printf 'capital of France?\\nsats in 1 BTC?\\n' | batchask
+  batchask qs.txt --backend "ai-ask groq" --json
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, re, json, shlex, shutil, subprocess
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S{6,})|\b[A-Fa-f0-9]{40,}\b)")
+def parse_qs(text):
+    if re.search(r"^---\s*$", text, re.M):
+        qs = [b.strip() for b in re.split(r"^---\s*$", text, flags=re.M)]
+    else:
+        qs = [l.strip() for l in text.splitlines()]
+    return [q for q in qs if q and not q.startswith("#")]
+def build(qs, style):
+    head = (f"Answer each numbered question independently. Style: {style}.\n"
+            f"Format EXACTLY: a line '### A<number>' then the answer, for every question from 1 to {len(qs)}, in order. No other text.\n\n")
+    return head + "\n".join(f"Q{i+1}: {q}" for i, q in enumerate(qs))
+def split(resp, n):
+    ans = {}
+    parts = re.split(r"^\s*#{2,4}\s*A(\d+)\s*[:.)-]?\s*$", resp, flags=re.M)
+    for i in range(1, len(parts) - 1, 2):
+        k = int(parts[i]); v = parts[i + 1].strip()
+        if 1 <= k <= n and v and k not in ans: ans[k] = v
+    if not ans:   # fallback: 'A1: ...' lines
+        for m in re.finditer(r"^\s*\**A(\d+)\**\s*[:.)-]\s*(.+?)(?=^\s*\**A\d+\**\s*[:.)-]|\Z)", resp, re.M | re.S):
+            k = int(m.group(1))
+            if 1 <= k <= n and k not in ans: ans[k] = m.group(2).strip()
+    return ans
+def call(backend, prompt, stdin_mode):
+    argv = backend + ([] if stdin_mode else [prompt])
+    r = subprocess.run(argv, input=prompt if stdin_mode else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    if r.returncode != 0: raise RuntimeError(f"backend exit {r.returncode}: {r.stderr.strip()[-200:]}")
+    return r.stdout
+def main(a):
+    src, backend, style, js, retry, maxq, dry, stdin_mode = None, None, "concise, 1-3 sentences, say 'unknown' if unsure", False, False, 40, False, False
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--backend": backend = shlex.split(a.pop(0))
+        elif x == "--style": style = a.pop(0)
+        elif x == "--json": js = True
+        elif x == "--retry-missing": retry = True
+        elif x == "--max-q": maxq = int(a.pop(0))
+        elif x == "--dry-run": dry = True
+        elif x == "--stdin-prompt": stdin_mode = True
+        elif x.startswith("--"): print(f"batchask: unknown arg {x}", file=sys.stderr); return 2
+        elif src is None: src = x
+        else: print("batchask: one input file only", file=sys.stderr); return 2
+    text = sys.stdin.read() if src in (None, "-") else open(src, encoding="utf-8").read()
+    qs = parse_qs(text)
+    if not qs: print("batchask: no questions", file=sys.stderr); return 2
+    bad = [i + 1 for i, q in enumerate(qs) if SECRET.search(q)]
+    if bad: print(f"batchask: refusing to send: secret-looking text in question(s) {bad}", file=sys.stderr); return 2
+    if backend is None:
+        env = os.environ.get("BATCHASK_BACKEND", "").strip()
+        if env:
+            backend = shlex.split(env)
+        else:
+            for cand in (["ai-tier", "ask2"], ["ai-ask", "llm7"], ["llm"], ["ollama", "run", "llama3.2"]):
+                if shutil.which(cand[0]): backend = cand; break
+            else:
+                print("batchask: no backend found; pass --backend \"CMD\" or set BATCHASK_BACKEND (prompt is passed as the last arg)", file=sys.stderr); return 2
+    if not backend or not shutil.which(backend[0]): print(f"batchask: backend not found: {backend[:1]}", file=sys.stderr); return 2
+    chunks = [qs[i:i + maxq] for i in range(0, len(qs), maxq)]
+    if dry:
+        for c in chunks: print(build(c, style)); print("=====")
+        print(f"batchask: {len(qs)} questions -> {len(chunks)} call(s)", file=sys.stderr); return 0
+    answers, calls = {}, 0
+    for ci, c in enumerate(chunks):
+        got = {}
+        for attempt in (1, 2):      # one whole-batch retry if nothing parsable came back
+            try: resp = call(backend, build(c, style), stdin_mode); calls += 1
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e: print(f"batchask: {e}", file=sys.stderr); resp = ""
+            got = split(resp, len(c))
+            if got: break
+            print(f"batchask: chunk {ci+1}: no '### A<n>' answers parsed ({len(resp)} chars back){', retrying once' if attempt == 1 else ''}", file=sys.stderr)
+        for k, v in got.items(): answers[ci * maxq + k] = v
+    missing = [i for i in range(1, len(qs) + 1) if i not in answers]
+    if retry:
+        for i in missing[:]:
+            try: resp = call(backend, f"Answer concisely ({style}):\n{qs[i-1]}", stdin_mode); calls += 1
+            except (RuntimeError, subprocess.TimeoutExpired, OSError): continue
+            if resp.strip(): answers[i] = resp.strip(); missing.remove(i)
+    if js:
+        print(json.dumps([{"n": i, "q": q, "a": answers.get(i)} for i, q in enumerate(qs, 1)], ensure_ascii=False, indent=1))
+    else:
+        for i, q in enumerate(qs, 1):
+            print(f"Q{i}: {q}\nA{i}: {answers.get(i, 'MISSING')}\n")
+    print(f"batchask: {len(qs)} questions, {calls} call(s) instead of {len(qs)}, {len(missing)} missing", file=sys.stderr)
+    return 1 if missing else 0
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)
+    except (OSError, ValueError) as e: print(f"batchask: {e}", file=sys.stderr); sys.exit(2)

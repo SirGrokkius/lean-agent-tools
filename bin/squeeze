@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""squeeze - compress long command output before an agent reads it.
+  cmd 2>&1 | squeeze [-n 40] [--ai] [--goal "what I need to know"]
+  squeeze [-n 40] [--ai] [--goal ...] -- cmd args...     (runs cmd, reports exit code + time)
+Deterministic pass (always, no AI, no network):
+  strips ANSI/progress bars, collapses repeated lines (digits/hex/timestamps normalised) into 'xN',
+  always keeps error/warn/fail/traceback lines, then keeps head + tail within -n lines.
+  Full raw output is saved to /tmp/squeeze/<ts>.log (path printed) so nothing is lost.
+--ai: if the result is still longer than -n, ONE call to $SQUEEZE_AI_CMD (default: `llm`) summarises it into <=10 bullets.
+  Secret-looking strings are always redacted in what is printed; if more than 3 redactions happen, --ai is skipped (keyless providers log prompts).
+Added 2026-10-22 (mini-apps #2)."""
+import sys, re, os, time, subprocess, collections, datetime
+args = sys.argv[1:]; N = 40; AI = False; GOAL = ""; cmd = None
+while args:
+    a = args.pop(0)
+    if a == "-n": N = int(args.pop(0))
+    elif a == "--ai": AI = True
+    elif a == "--goal": GOAL = args.pop(0)
+    elif a == "--": cmd = args; break
+    elif a in ("-h", "--help"): print(__doc__); sys.exit(0)
+    else: print(f"squeeze: unknown arg {a}", file=sys.stderr); sys.exit(2)
+rc = None; t0 = time.time()
+if cmd:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    raw, rc = p.stdout.decode("utf-8", "replace"), p.returncode
+else:
+    raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+dt = time.time() - t0
+os.makedirs("/tmp/squeeze", exist_ok=True)
+logp = f"/tmp/squeeze/{datetime.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}.log"
+open(logp, "w").write(raw)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+text = ANSI.sub("", raw)
+lines = []
+for l in text.split("\n"):
+    if "\r" in l: l = l.split("\r")[-1]          # progress bars: keep final state
+    l = l.rstrip()
+    if l: lines.append(l)
+def norm(l):
+    l = re.sub(r"\b[0-9a-f]{7,}\b", "#", l)
+    l = re.sub(r"\d+([.:]\d+)*", "0", l)
+    return l
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+)|\b[A-Fa-f0-9]{40,}\b|(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.]))")
+IMP = re.compile(r"(error|fail|fatal|exception|traceback|warn|denied|refused|timeout|timed out|not found|\b429\b|(?:http|status|code)[ /:=]*5\d\d\b|panic|abort|killed|assert)", re.I)
+# collapse consecutive runs AND global repeats of same normalised shape
+groups = collections.OrderedDict()
+for i, l in enumerate(lines):
+    k = norm(l)
+    if k in groups: groups[k][1] += 1; groups[k][2] = l
+    else: groups[k] = [l, 1, l, i]
+uniq = [(v[3], v[0] + (f"   [x{v[1]}, last: {v[2][:80]}]" if v[1] > 1 and v[2] != v[0] else (f"   [x{v[1]}]" if v[1] > 1 else ""))) for v in groups.values()]
+imp_idx = {i for i, s in uniq if IMP.search(s)}
+body = [s for _, s in uniq]
+if len(body) > N:
+    h = max(5, N // 3); t = max(5, N // 3)
+    keep_i = set(range(h)) | set(range(len(uniq) - t, len(uniq)))
+    imp_pos = [k for k, (i, _) in enumerate(uniq) if i in imp_idx and k not in keep_i]
+    keep_i |= set(imp_pos[: max(0, N - h - t)])
+    body, prev = [], -1
+    for k in sorted(keep_i):
+        if k != prev + 1: body.append(f"  ... [{k - prev - 1} lines omitted]")
+        body.append(uniq[k][1]); prev = k
+    if prev < len(uniq) - 1: body.append(f"  ... [{len(uniq) - 1 - prev} lines omitted]")
+head = f"[squeeze] {len(raw.splitlines())} lines/{len(raw)} B -> {len(body)} lines | {len(imp_idx)} error/warn lines | raw: {logp}"
+if rc is not None: head += f" | exit {rc} in {dt:.1f}s"
+out = [head] + [l[:300] for l in body]
+if AI and len(body) > N:
+    red, n = SECRET.subn("[REDACTED]", "\n".join(body))
+    if n > 3: out.append(f"[squeeze] --ai skipped: {n} secret-looking strings; read the raw log locally instead")
+    else:
+        prompt = ("Summarise this command output for a busy engineer in at most 10 terse bullets. "
+                  "Lead with errors/failures and their likely cause, then key results/numbers. Do not invent anything. "
+                  + (f"They specifically need: {GOAL}. " if GOAL else "") + "\n\n" + red[:12000])
+        try:
+            r = subprocess.run(os.environ.get("SQUEEZE_AI_CMD", "llm").split() + [prompt], capture_output=True, text=True, timeout=150)
+            s = r.stdout.strip()
+            if r.returncode == 0 and s:
+                out = [head + " | AI summary (Tier-2)"] + s.splitlines()[:14] + ["[squeeze] errors kept verbatim:"] + [uniq[k][1][:300] for k, (i, _) in enumerate(uniq) if i in imp_idx][:8]
+            else: out.append("[squeeze] --ai failed; deterministic result above")
+        except Exception as e: out.append(f"[squeeze] --ai error {e.__class__.__name__}; deterministic result above")
+print(SECRET.sub("[REDACTED]", "\n".join(out)))
+sys.exit(rc if rc is not None else 0)

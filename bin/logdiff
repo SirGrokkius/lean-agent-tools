@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""logdiff - collapse repeated log lines and whole stack traces into counted templates.
+
+Usage:
+  logdiff [FILE ...] [--max N] [--top K] [--since-file STATE] [--only-new] [--no-redact-check]
+  cmd 2>&1 | logdiff
+
+  --max N           max output lines (default 60). Error/warn templates and traces are printed first-class:
+                    they are never dropped in favour of normal lines.
+  --top K           keep only the K most frequent normal (non-error) templates
+  --since-file F    remember template hashes across runs (JSON, mode 600); new ones are tagged NEW
+  --only-new        with --since-file: print only templates never seen before (great for cron/agents)
+How: each line is normalised (timestamps, UUIDs, hex ids, IPs, numbers, quoted strings, paths' numeric parts
+-> <TS> <UUID> <HEX> <IP> <N> <STR>), identical templates are merged into 'xCOUNT  first example'.
+Python tracebacks ('Traceback (most recent call last):' ... 'XError: msg') and Java/JS traces
+(an exception line followed by indented 'at ...' frames, incl. 'Caused by:') are one unit each;
+identical traces collapse to 'xCOUNT trace: Type: msg (N frames, last: ...)'.
+ANSI colours and progress-bar carriage returns are stripped. Secret-looking strings are redacted.
+Footer: 'logdiff: IN lines/bytes -> OUT lines/bytes (-P%) templates=T traces=X'.
+No AI, no network. Exit 0 (1 if a file can't be read, 2 usage).
+
+Examples:
+  logdiff /var/log/app.log --max 40
+  journalctl -u myjob --since today | logdiff --since-file ~/.cache/logdiff/myjob.json --only-new
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, re, json, hashlib, collections
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|(?i:(?:api[_-]?key|token|secret|password|passwd|authorization|bearer)(?:\s*[:=]\s*|\s+)[A-Za-z0-9._~+/-]{8,}=*)|\b[A-Fa-f0-9]{40,}\b|(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.]))")
+def redact(s): return SECRET.sub("[REDACTED]", s)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+NORM = [(re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?([.,]\d+)?(Z|[+-]\d\d:?\d\d)?"), "<TS>"),
+        (re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} \d\d:\d\d:\d\d"), "<TS>"),
+        (re.compile(r"\b\d\d:\d\d:\d\d([.,]\d+)?\b"), "<TS>"),
+        (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<UUID>"),
+        (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"), "<IP>"),
+        (re.compile(r"\b(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{6,}\b|0x[0-9a-fA-F]+"), "<HEX>"),
+        (re.compile(r"\"[^\"]{0,200}\"|'[^']{0,200}'"), "<STR>"),
+        (re.compile(r"\d+(\.\d+)?"), "<N>")]
+ERR = re.compile(r"(error|fail|fatal|exception|traceback|warn|denied|refused|timeout|timed out|panic|abort|killed|\b5\d\d\b|\b429\b)", re.I)
+PY_START = re.compile(r"^\s*Traceback \(most recent call last\):")
+EXC = re.compile(r"^\s*(?:Caused by: |Exception in thread \"[^\"]*\" )?([A-Za-z_$][\w$.]*(?:Error|Exception|Exit|Interrupt|Warning|Throwable)|[A-Z]\w*Error)\b:?\s*(.*)$")
+FRAME = re.compile(r"^\s+(at\s+\S|\.\.\. \d+ more)")
+def norm(l):
+    for rx, rep in NORM: l = rx.sub(rep, l)
+    return l
+def units(lines):
+    """yield ('line', text) or ('trace', [lines])"""
+    i, n = 0, len(lines)
+    while i < n:
+        l = lines[i]
+        if PY_START.match(l):
+            j = i + 1
+            while j < n and (lines[j].startswith((" ", "\t")) or lines[j].strip() == "" or
+                             lines[j].startswith(("During handling", "The above exception"))
+                             or PY_START.match(lines[j])):
+                j += 1
+            if j < n and EXC.match(lines[j]): j += 1      # the final 'XError: msg' line
+            yield ("trace", lines[i:j]); i = j; continue
+        if EXC.match(l) and i + 1 < n and FRAME.match(lines[i + 1]):
+            j = i + 1
+            while j < n and (FRAME.match(lines[j]) or lines[j].lstrip().startswith("Caused by:")): j += 1
+            yield ("trace", lines[i:j]); i = j; continue
+        yield ("line", l); i += 1
+def trace_info(tl):
+    exc = next((m for m in (EXC.match(x) for x in reversed(tl)) if m and not PY_START.match(m.string)), None)
+    etype, emsg = (exc.group(1), exc.group(2)) if exc else ("Trace", tl[0].strip())
+    frames = [x.strip() for x in tl if re.match(r"^\s+(File \"|at\s)", x)]
+    key_parts = [norm(f) for f in frames] + [etype]
+    return etype, emsg, frames, hashlib.sha1("\n".join(key_parts).encode()).hexdigest()[:16]
+def main(a):
+    files, mx, top, sf, only_new = [], 60, None, None, False
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--max": mx = int(a.pop(0))
+        elif x == "--top": top = int(a.pop(0))
+        elif x == "--since-file": sf = os.path.expanduser(a.pop(0))
+        elif x == "--only-new": only_new = True
+        elif x.startswith("--"): print(f"logdiff: unknown arg {x}", file=sys.stderr); return 2
+        else: files.append(x)
+    if only_new and not sf: print("logdiff: --only-new needs --since-file", file=sys.stderr); return 2
+    raw = []
+    try:
+        if files:
+            for f in files:
+                with open(f, encoding="utf-8", errors="replace") as fh: raw.append(fh.read())
+        else: raw.append(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    except OSError as e: print(f"logdiff: {e}", file=sys.stderr); return 1
+    text = "".join(raw); in_bytes = len(text.encode())
+    lines = []
+    for l in ANSI.sub("", text).split("\n"):
+        if "\r" in l: l = l.rstrip("\r").split("\r")[-1]
+        lines.append(l.rstrip())
+    in_lines = sum(1 for l in lines if l)
+    groups = collections.OrderedDict()     # key -> dict
+    ntr = 0
+    for kind, u in units(lines):
+        if kind == "line":
+            if not u.strip(): continue
+            k = "L" + hashlib.sha1(norm(u).encode()).hexdigest()[:16]
+            g = groups.setdefault(k, {"kind": "line", "ex": u, "last": u, "n": 0, "err": bool(ERR.search(u))})
+            g["n"] += 1; g["last"] = u
+        else:
+            ntr += 1
+            etype, emsg, frames, h = trace_info(u)
+            k = "T" + h
+            g = groups.setdefault(k, {"kind": "trace", "etype": etype, "emsg": emsg, "frames": frames, "n": 0, "err": True, "msgs": set()})
+            g["n"] += 1; g["msgs"].add(norm(emsg))
+    seen = set()
+    if sf and os.path.exists(sf):
+        try: seen = set(json.load(open(sf)).get("templates", []))
+        except (OSError, ValueError): seen = set()
+    new = {k for k in groups if k not in seen}
+    items = list(groups.items())
+    if only_new: items = [(k, g) for k, g in items if k in new]
+    errs = [(k, g) for k, g in items if g["err"]]
+    normal = [(k, g) for k, g in items if not g["err"]]
+    if top is not None:
+        keep = {k for k, _ in sorted(normal, key=lambda kg: -kg[1]["n"])[:top]}
+        normal = [(k, g) for k, g in normal if k in keep]
+    budget_norm = max(0, mx - len(errs))
+    if len(normal) > budget_norm:                     # keep the most frequent normal templates
+        keep = {k for k, _ in sorted(normal, key=lambda kg: -kg[1]["n"])[:budget_norm]}
+        dropped = len(normal) - len(keep); normal = [(k, g) for k, g in normal if k in keep]
+    else: dropped = 0
+    order = {k: i for i, k in enumerate(groups)}
+    chosen = sorted(errs[:mx] + normal, key=lambda kg: order[kg[0]])
+    out = []
+    for k, g in chosen:
+        tag = "NEW " if sf and k in new else ""
+        if g["kind"] == "line":
+            s = f"{tag}x{g['n']:<4} {g['ex'][:300]}"
+            if g["n"] > 1 and g["last"] != g["ex"]: s += f"   [last: {g['last'][:120]}]"
+        else:
+            last = g["frames"][-1][:140] if g["frames"] else "-"
+            var = f", {len(g['msgs'])} msg variants" if len(g["msgs"]) > 1 else ""
+            s = f"{tag}x{g['n']:<4} trace: {g['etype']}: {g['emsg'][:160]} ({len(g['frames'])} frames, last: {last}{var})"
+        out.append(redact(s))
+    if dropped: out.append(f"... {dropped} rarer normal templates omitted (raise --max)")
+    if len(errs) > mx: out.append(f"... {len(errs) - mx} more error/trace templates omitted")
+    body = "\n".join(out)
+    if body: print(body)
+    ob = len(body.encode()) + (1 if body else 0)
+    pct = f"{100 - 100 * ob / max(in_bytes, 1):.1f}"
+    print(f"logdiff: {in_lines} lines/{in_bytes} B -> {len(out)} lines/{ob} B (-{pct}%) templates={sum(1 for g in groups.values() if g['kind']=='line')} traces={ntr} ({sum(1 for g in groups.values() if g['kind']=='trace')} unique)"
+          + (f" new={len(new)}" if sf else ""), file=sys.stderr if os.environ.get("LOGDIFF_FOOTER_STDERR") else sys.stdout)
+    if sf:
+        d = os.path.dirname(sf)
+        if d: os.makedirs(d, exist_ok=True)
+        tmp = sf + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh: json.dump({"templates": sorted(seen | set(groups))[-50000:]}, fh)
+        os.replace(tmp, sf)
+    return 0
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)
+    except ValueError as e: print(f"logdiff: {e}", file=sys.stderr); sys.exit(2)

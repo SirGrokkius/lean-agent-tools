@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""ctxpack - pack only the relevant snippets of a folder/repo for a question, under a token cap.
+
+Usage:
+  ctxpack "question or keywords" [DIR ...] [--cap TOKENS] [--context N] [--glob G] [--max-files K] [--list]
+
+  DIR            folders/files to search (default .)
+  --cap N        token budget for the whole pack (default 3000; ~4 chars/token)
+  --context N    lines of context around each hit (default 3)
+  --glob G       ripgrep glob filter, repeatable (e.g. --glob '*.py' --glob '!tests/*')
+  --max-files K  at most K files in the pack (default 12)
+  --list         only print the ranked file list with scores (cheapest first look)
+  --terms a,b    use exactly these search terms instead of extracting them from the question
+
+How it ranks: terms = question words minus stopwords (len>=3, plus identifiers like snake_case/CamelCase).
+Each term is searched with ripgrep (fixed-string, case-insensitive, respects .gitignore, skips binaries).
+File score = sum over terms of log-damped hits x IDF(term) + bonus for a term in the path.
+Snippets = merged hit windows, best windows first, each tagged 'path:start-end'.
+Secret-looking strings are redacted; .env*, *.pem, *.key, id_rsa*, *vault*, *secret* files are never read.
+Needs: rg (ripgrep) on PATH. No AI, no network.
+
+Examples:
+  ctxpack "where is the retry limit enforced" ./src --cap 2000
+  ctxpack "nostr dm watch dedupe" ~/bin --list
+Exit codes: 0 ok, 1 no hits, 2 usage/error.
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, re, math, subprocess, shutil, collections
+
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+)|\b[A-Fa-f0-9]{40,}\b|(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.]))")
+def redact(s): return SECRET.sub("[REDACTED]", s)
+DENY = ["!*.bak", "!*.bak-*", "!*.bak.*", "!*~", "!.env*", "!*.pem", "!*.key", "!id_rsa*", "!id_ed25519*", "!*vault*", "!*secret*", "!*.kdbx", "!*credentials*", "!.git/", "!node_modules/", "!*.min.js", "!*.lock", "!package-lock.json"]
+DENY_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.(pem|key|kdbx)|id_rsa[^/]*|id_ed25519[^/]*|[^/]*vault[^/]*|[^/]*secret[^/]*|[^/]*credentials[^/]*)$", re.I)
+STOP = set("""a an the and or but if then else for to of in on at by with from as is are was were be been being this that these those it its
+i you he she we they me my our your their what which who whom whose where when why how do does did done can could should would will shall may might must
+not no yes all any some each every there here into out up down over under about after before again also just only very more most less few much many
+please find show tell give get make need want use using used file files code repo folder dir directory question""".split())
+
+def terms_from(q):
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_.-]*[A-Za-z0-9]|[A-Za-z0-9]{3,}", q)
+    out = []
+    for t in toks:
+        tl = t.lower().strip(".-")
+        if len(tl) < 3 or tl in STOP: continue
+        if tl not in out: out.append(tl)
+    return out[:12]
+
+def rg_count(term, paths, globs):
+    cmd = ["rg", "--count-matches", "-i", "-F", "--no-messages", "--max-filesize", "2M"]
+    for g in DENY + globs: cmd += ["--glob", g]
+    cmd += ["--", term] + paths
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    out = {}
+    for line in r.stdout.splitlines():
+        p, _, n = line.rpartition(":")
+        if p and n.isdigit() and not DENY_RE.search(p): out[p] = int(n)
+    return out
+
+def main(a):
+    q, dirs, cap, ctx, globs, maxf, lst, fixed = None, [], 3000, 3, [], 12, False, None
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--cap": cap = int(a.pop(0))
+        elif x == "--context": ctx = int(a.pop(0))
+        elif x == "--glob": globs.append(a.pop(0))
+        elif x == "--max-files": maxf = int(a.pop(0))
+        elif x == "--list": lst = True
+        elif x == "--terms": fixed = [t.strip().lower() for t in a.pop(0).split(",") if t.strip()]
+        elif x.startswith("--"): print(f"ctxpack: unknown arg {x}", file=sys.stderr); return 2
+        elif q is None: q = x
+        else: dirs.append(x)
+    if fixed and q is not None and os.path.exists(q): dirs.insert(0, q); q = None   # --terms given: positionals are paths
+    if q is None and not fixed: print(__doc__); return 2
+    if not shutil.which("rg"): print("ctxpack: needs ripgrep (rg) on PATH", file=sys.stderr); return 2
+    dirs = dirs or ["."]
+    for d in dirs:
+        if not os.path.exists(d): print(f"ctxpack: no such path {d}", file=sys.stderr); return 2
+    terms = fixed or terms_from(q)
+    if not terms: print("ctxpack: no usable search terms", file=sys.stderr); return 2
+    hits = {t: rg_count(t, dirs, globs) for t in terms}
+    allf = set().union(*[set(h) for h in hits.values()])
+    if not allf: print(f"ctxpack: no hits for {terms}", file=sys.stderr); return 1
+    N = len(allf)
+    idf = {t: math.log(1 + N / (1 + len(h))) for t, h in hits.items()}
+    score = collections.Counter()
+    for t, h in hits.items():
+        for p, n in h.items():
+            score[p] += (1 + math.log(n)) * idf[t]
+    for p in allf:
+        pl = p.lower()
+        score[p] += sum(1.5 * idf[t] for t in terms if t in os.path.basename(pl))
+        cover = sum(1 for t in terms if p in hits[t])
+        score[p] *= 1 + 0.5 * (cover - 1)            # reward files that match several terms
+    ranked = score.most_common(maxf)
+    if lst:
+        print(f"ctxpack terms: {', '.join(terms)}  ({N} files hit)")
+        for p, s in ranked: print(f"{s:7.1f}  {p}")
+        return 0
+    budget = cap * 4
+    out = [f"# ctxpack for: {redact(q or ','.join(terms))}", f"# terms: {', '.join(terms)} | {N} files hit, showing <= {maxf} | cap {cap} tok"]
+    used = sum(len(l) + 1 for l in out)
+    tre = re.compile("|".join(re.escape(t) for t in terms), re.I)
+    total_src = 0
+    windows = []
+    for rank, (p, s) in enumerate(ranked):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f: lines = f.read().splitlines()
+        except OSError: continue
+        total_src += sum(len(l) + 1 for l in lines)
+        hl = [i for i, l in enumerate(lines) if tre.search(l)]
+        # merge hit windows
+        segs = []
+        for i in hl:
+            lo, hi = max(0, i - ctx), min(len(lines) - 1, i + ctx)
+            if segs and lo <= segs[-1][1] + 1: segs[-1][1] = hi; segs[-1][2] += 1
+            else: segs.append([lo, hi, 1])
+        for lo, hi, n in segs:
+            txt = lines[lo:hi + 1]
+            distinct = len({m.group(0).lower() for l in txt for m in tre.finditer(l)})
+            windows.append((s * (distinct + 0.3 * n) / (1 + 0.02 * len(txt)), rank, p, lo, hi, txt))
+    windows.sort(key=lambda w: -w[0])
+    chosen, skipped = [], 0
+    for w in windows:
+        body = "\n".join(l[:300] for l in w[5])
+        cost = len(body) + len(w[2]) + 20
+        if used + cost > budget: skipped += 1; continue
+        chosen.append(w); used += cost
+    chosen.sort(key=lambda w: (w[1], w[3]))
+    last = None
+    for _, rank, p, lo, hi, txt in chosen:
+        if p != last: out.append(f"\n== {p}"); last = p
+        out.append(f"-- {p}:{lo+1}-{hi+1}")
+        out.extend(redact(l[:300]) for l in txt)
+    out.append(f"\n# ctxpack: {len(chosen)} snippets from {len({c[2] for c in chosen})} files, ~{used//4} tok (ranked files total ~{total_src//4} tok); {skipped} snippets over cap skipped")
+    print("\n".join(out))
+    return 0
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)

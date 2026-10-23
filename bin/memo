@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""memo - cache a deterministic shell command's output, keyed by the command AND its input files.
+Re-running an unchanged command costs 0 s and 0 reads; touching any input file invalidates it.
+
+Usage:
+  memo [--ttl 1h] [--dep FILE]... [--no-auto] -- CMD ARGS...
+  memo --stats | --list | --purge [--older 7d] | --forget -- CMD ARGS...
+
+  --ttl T      max age (s/m/h/d; default 1h). Use short TTLs for anything factual or networked.
+  --dep FILE   extra input file or dir whose mtime+size is part of the key (repeatable; dirs: all files, max 5000)
+  --no-auto    don't auto-treat existing-file arguments of CMD as inputs (default: they are)
+  --quiet-hit  don't print the '[memo hit ...]' note on stderr
+Key = sha256(argv, cwd, mtime+size of every input file). Exit code of CMD is passed through.
+NOT cached: non-zero exits, output > 4 MB, output that contains secret-looking strings.
+Store: ~/.cache/memo/ (mode 700, files 600). --purge only deletes files inside that dir.
+CMD runs without a shell (argv list); to use pipes run: memo -- bash -c '...' (your own string, never untrusted input).
+
+Examples:
+  memo -- rg -c TODO src/            # src/ is an existing dir -> its files are inputs
+  memo --dep data.csv -- python3 report.py
+  memo --ttl 10m -- git log --oneline -20
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, os, re, json, time, hashlib, subprocess
+D = os.path.expanduser(os.environ.get("MEMO_DIR", "~/.cache/memo"))
+SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S{6,}))")
+def dur(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", s.strip())
+    if not m: raise ValueError(f"bad duration {s}")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+def stamp(p, out):
+    try:
+        if os.path.isdir(p):
+            n = 0
+            for root, ds, fs in os.walk(p):
+                ds[:] = sorted(d for d in ds if d not in (".git", "node_modules", "__pycache__"))
+                for f in sorted(fs):
+                    fp = os.path.join(root, f); st = os.stat(fp); out.append(f"{fp}|{st.st_mtime_ns}|{st.st_size}"); n += 1
+                    if n >= 5000: out.append("TRUNC"); return
+        else:
+            st = os.stat(p); out.append(f"{os.path.abspath(p)}|{st.st_mtime_ns}|{st.st_size}")
+    except OSError: out.append(f"{p}|missing")
+def key(cmd, deps, auto):
+    parts = [json.dumps(cmd), os.getcwd()]
+    files = list(deps) + ([c for c in cmd[1:] if not c.startswith("-") and os.path.exists(c)] if auto else [])
+    # the executable itself (script edits must invalidate)
+    exe = cmd[0] if os.path.exists(cmd[0]) else None
+    if not exe:
+        for d in os.environ.get("PATH", "").split(":"):
+            if os.path.isfile(os.path.join(d, cmd[0])): exe = os.path.join(d, cmd[0]); break
+    if exe: files.append(exe)
+    for f in files: stamp(f, parts)
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+def safe_path(name):
+    p = os.path.realpath(os.path.join(D, name))
+    if os.path.dirname(p) != os.path.realpath(D): raise SystemExit("memo: refusing path outside cache dir")
+    return p
+def main(a):
+    ttl, deps, auto, quiet, mode, older = 3600.0, [], True, False, "run", None
+    cmd = None
+    while a:
+        x = a.pop(0)
+        if x in ("-h", "--help"): print(__doc__); return 0
+        elif x == "--ttl": ttl = dur(a.pop(0))
+        elif x == "--dep": deps.append(a.pop(0))
+        elif x == "--no-auto": auto = False
+        elif x == "--quiet-hit": quiet = True
+        elif x in ("--stats", "--list", "--purge", "--forget"): mode = x[2:]
+        elif x == "--older": older = dur(a.pop(0))
+        elif x == "--": cmd = a; break
+        else: print(f"memo: unknown arg {x}", file=sys.stderr); return 2
+    os.makedirs(D, mode=0o700, exist_ok=True)
+    ents = [f for f in os.listdir(D) if f.endswith(".json")]
+    if mode in ("stats", "list"):
+        now = time.time(); tot = 0; hits = 0; saved = 0.0
+        for f in ents:
+            try: m = json.load(open(safe_path(f)))
+            except (OSError, ValueError): continue
+            tot += len(m.get("out", "")); hits += m.get("hits", 0); saved += m.get("hits", 0) * m.get("secs", 0)
+            if mode == "list": print(f"{int(now - m['t'])}s ago  hits={m.get('hits',0)}  {m.get('secs',0):.2f}s  {' '.join(m['cmd'])[:100]}")
+        print(f"memo: {len(ents)} entries, {tot} B stored, {hits} hits, ~{saved:.1f} s of command time saved")
+        return 0
+    if mode == "purge":
+        now = time.time(); n = 0
+        for f in ents:
+            p = safe_path(f)
+            if older is None or now - os.path.getmtime(p) > older: os.remove(p); n += 1
+        print(f"memo: purged {n} entries from {D}"); return 0
+    if not cmd: print("memo: need -- CMD ...", file=sys.stderr); return 2
+    k = key(cmd, deps, auto); p = safe_path(k + ".json")
+    if mode == "forget":
+        if os.path.exists(p): os.remove(p)
+        print("memo: forgot"); return 0
+    if os.path.exists(p):
+        try:
+            m = json.load(open(p))
+            if time.time() - m["t"] <= ttl:
+                sys.stdout.write(m["out"]); sys.stderr.write(m.get("err", ""))
+                m["hits"] = m.get("hits", 0) + 1
+                tmp = p + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh: json.dump(m, fh)
+                os.replace(tmp, p)
+                if not quiet: print(f"[memo hit, {int(time.time()-m['t'])}s old, saved ~{m.get('secs',0):.2f}s]", file=sys.stderr)
+                return 0
+        except (OSError, ValueError, KeyError): pass
+    t = time.time()
+    try: r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError: print(f"memo: command not found: {cmd[0]}", file=sys.stderr); return 127
+    secs = time.time() - t
+    out = r.stdout.decode("utf-8", "replace"); err = r.stderr.decode("utf-8", "replace")
+    sys.stdout.write(out); sys.stderr.write(err)
+    why = None
+    if r.returncode != 0: why = f"exit {r.returncode}"
+    elif len(out) + len(err) > 4_000_000: why = "too big"
+    elif SECRET.search(out) or SECRET.search(err): why = "secret-looking output"
+    if why is None:
+        tmp = p + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh: json.dump({"t": time.time(), "cmd": cmd, "out": out, "err": err, "secs": secs, "hits": 0}, fh)
+        os.replace(tmp, p)
+    elif not quiet: print(f"[memo: not cached ({why})]", file=sys.stderr)
+    return r.returncode
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)
+    except ValueError as e: print(f"memo: {e}", file=sys.stderr); sys.exit(2)

@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys
+import os
+import re
+import json
+import hashlib
+import datetime
+import urllib.request
+import urllib.parse
+import urllib.error
+import socket
+import ipaddress
+import argparse
+import difflib
+import html.parser
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+SECRET_REGEXES = [
+    re.compile(r'\bsk-[A-Za-z0-9]{20,}\b'),
+    re.compile(r'\bghp_[A-Za-z0-9]{36}\b'),
+    re.compile(r'\bxox[abp]-[A-Za-z0-9-]{10,}\b'),
+    re.compile(r'\bnsec1[0-9A-Za-z]{40,}\b'),
+    re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+    re.compile(r'\b(?:api_key|token|secret|password|authorization)\s*[:=]\s*\S+', re.IGNORECASE),
+    re.compile(r'\b[A-Fa-f0-9]{40,}\b'),
+    re.compile(r'(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.])'),
+    re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)'),
+]
+
+VOLATILE_REGEXES = [
+    re.compile(r'\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)?\b'),
+    re.compile(r'\b(?:nonce|csrf)[-_=][A-Za-z0-9]+\b', re.IGNORECASE),
+    re.compile(r'\b[a-f0-9]{16,39}\b'),
+]
+
+def redact_secrets(text):
+    for rx in SECRET_REGEXES:
+        text = rx.sub('[REDACTED]', text)
+    return text
+
+def normalize_volatile(text):
+    for rx in VOLATILE_REGEXES:
+        text = rx.sub('[VOLATILE]', text)
+    return text
+
+class TextExtractor(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.ignore_tags = set(["script", "style", "nav", "footer", "header", "aside", "form", "noscript", "svg", "template", "iframe"])
+        self.skip = 0
+        self.text_parts = []
+    BLOCK = {"p", "div", "li", "br", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article",
+             "main", "pre", "blockquote", "dd", "dt", "table", "ul", "ol", "hr", "td", "th"}
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self.ignore_tags:
+            self.skip += 1
+        elif tag.lower() in self.BLOCK:
+            self.text_parts.append("\n")
+    def handle_endtag(self, tag):
+        if tag.lower() in self.ignore_tags and self.skip > 0:
+            self.skip -= 1
+        elif tag.lower() in self.BLOCK:
+            self.text_parts.append("\n")
+    def handle_data(self, data):
+        if self.skip == 0:
+            self.text_parts.append(data)
+    def get_text(self):
+        return "".join(self.text_parts)
+
+def allow_nets():
+    raw = os.environ.get("GROKKIUS_ALLOW_NETS", "").replace(",", " ").split()
+    f = os.path.expanduser("~/.config/grokkius-tools/allow-nets")
+    if os.path.isfile(f):
+        raw += [l.split("#")[0].strip() for l in open(f) if l.split("#")[0].strip()]
+    out = []
+    for r in raw:
+        try: out.append(ipaddress.ip_network(r, strict=False))
+        except ValueError: pass
+    return out
+
+def is_private_ip(host):
+    nets = allow_nets()
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True
+    for family, _, _, _, sockaddr in infos:
+        ip = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if any(ip_obj in n for n in nets):
+            continue
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_link_local or ip_obj.is_reserved:
+            return True
+    return False
+
+def fetch_url(url, allow_local):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        eprint(f"watchdiff: unsupported URL scheme: {parsed.scheme}")
+        sys.exit(2)
+    if not allow_local and is_private_ip(parsed.hostname or ""):
+        eprint("watchdiff: local network destinations are not allowed")
+        sys.exit(2)
+    class Redir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            p = urllib.parse.urlparse(newurl)
+            if p.scheme not in ("http", "https") or (not allow_local and is_private_ip(p.hostname or "")):
+                raise urllib.error.URLError("redirect to refused destination")
+            return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+    req = urllib.request.Request(url, headers={"User-Agent": "watchdiff/1.0"})
+    try:
+        with urllib.request.build_opener(Redir()).open(req, timeout=20) as resp:
+            max_bytes = 5 * 1024 * 1024
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                eprint("watchdiff: response too large")
+                sys.exit(2)
+            return data, resp.headers.get_content_type()
+    except Exception as e:
+        eprint(f"watchdiff: failed to fetch URL: {e}")
+        sys.exit(2)
+
+def read_local_file(path):
+    if path.startswith("file://") or "://" in path:
+        eprint("watchdiff: file:// or URL schemes not allowed as local file")
+        sys.exit(2)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        eprint(f"watchdiff: failed to read file: {e}")
+        sys.exit(2)
+
+def process_content(content_bytes, is_html, force_text):
+    text = ""
+    if is_html or force_text:
+        try:
+            decoded = content_bytes.decode(errors="ignore")
+            if "<html" in decoded.lower() or "<body" in decoded.lower() or "<!doctype" in decoded.lower() or is_html:
+                parser = TextExtractor()
+                parser.feed(decoded)
+                text = parser.get_text()
+            else:
+                text = decoded
+        except Exception:
+            text = content_bytes.decode(errors="ignore")
+    else:
+        text = content_bytes.decode(errors="ignore")
+
+    text = redact_secrets(text)
+
+    lines = []
+    for raw_line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", raw_line).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+def apply_ignores_and_volatiles(lines, ignore_patterns):
+    result = []
+    for line in lines:
+        if any(p.search(line) for p in ignore_patterns):
+            continue
+        norm_line = normalize_volatile(line)
+        result.append(norm_line)
+    return result
+
+def compute_hash(lines):
+    h = hashlib.sha256()
+    for l in lines:
+        h.update(l.encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+def load_state(state_path):
+    if not os.path.exists(state_path):
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_state(state_path, lines, sha256_hash):
+    state = {
+        "lines": lines,
+        "sha256": sha256_hash,
+        "fetched_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    d = os.path.dirname(state_path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = state_path + ".tmp%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_path)
+
+def diff_output(old, new, max_lines, ignore_reordering):
+    if ignore_reordering and sorted(old) == sorted(new):
+        return [], "+0 -0 lines"
+
+    diff = list(difflib.unified_diff(old, new, lineterm=""))
+    added = []
+    removed = []
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:].strip())
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:].strip())
+
+    if not added and not removed:
+        nd = list(difflib.ndiff(old, new))
+        for l in nd:
+            if l.startswith("+ "):
+                added.append(l[2:].strip())
+            elif l.startswith("- "):
+                removed.append(l[2:].strip())
+
+    out_lines = []
+    count = 0
+    for a in added:
+        if count >= max_lines:
+            break
+        out_lines.append("+ " + a)
+        count += 1
+    for r in removed:
+        if count >= max_lines:
+            break
+        out_lines.append("- " + r)
+        count += 1
+
+    summary = f"+{len(added)} -{len(removed)} lines"
+    return out_lines, summary
+
+def print_help():
+    print("""Usage: watchdiff TARGET [--name N] [--text] [--ignore REGEX ...] [--max N lines default 40] [--reset] [--allow-local] [--set] [-h] [--help]
+
+watchdiff re-checks a URL or file and only reports what changed (semantic line/paragraph-level diff).
+
+Options:
+  TARGET             Local file path or http(s) URL
+  --name N           Custom state name (default: sha1(target))
+  --text             Treat input as text / parse text
+  --ignore REGEX     Ignore lines matching regex (can be specified multiple times)
+  --max N            Maximum diff lines to output (default: 40)
+  --reset            Delete state file for this target and exit 0
+  --allow-local      Allow local/private network URLs
+  --set              Ignore pure reordering when comparing
+
+Exit codes: 0 baseline saved / no change, 3 changed (diff printed), 2 error/refused.
+State: ~/.cache/watchdiff/<name>.json (mode 600, override with WATCHDIFF_DIR); secrets are
+redacted before storing; volatile dates/hashes/nonces are normalized so they don't count as changes.
+URLs: http(s) only; local/private addresses refused (also on redirects) unless --allow-local.
+  -h, --help         Show this help message and exit
+
+Examples:
+  watchdiff https://example.com/docs
+  watchdiff page.html --name docs --ignore 'Footer'
+  watchdiff data.txt --max 20 --reset
+""")
+    sys.exit(0)
+
+def main():
+    parser = argparse.ArgumentParser(prog="watchdiff", add_help=False)
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("--name")
+    parser.add_argument("--text", action="store_true")
+    parser.add_argument("--ignore", action="append", default=[])
+    parser.add_argument("--max", type=int, default=40)
+    parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--allow-local", action="store_true")
+    parser.add_argument("--set", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+
+    args, unknown = parser.parse_known_args()
+    if args.help:
+        print_help()
+
+    if unknown:
+        eprint(f"watchdiff: unknown arguments: {' '.join(unknown)}")
+        sys.exit(2)
+
+    if not args.target:
+        eprint("watchdiff: TARGET required")
+        sys.exit(2)
+
+    cache_dir = os.environ.get("WATCHDIFF_DIR") or os.path.expanduser(os.path.join("~", ".cache", "watchdiff"))
+    if args.name and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,80}", args.name):
+        eprint("watchdiff: --name may only contain letters, digits, _ . - (no paths)")
+        sys.exit(2)
+    name = args.name if args.name else hashlib.sha1(args.target.encode()).hexdigest()
+    state_path = os.path.join(cache_dir, f"{name}.json")
+
+    if args.reset:
+        try:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+            print("watchdiff: state reset")
+        except Exception as e:
+            eprint(f"watchdiff: failed to reset state: {e}")
+            sys.exit(2)
+        sys.exit(0)
+
+    ignore_patterns = [re.compile(p) for p in args.ignore]
+
+    parsed_url = urllib.parse.urlparse(args.target)
+    if parsed_url.scheme in ("http", "https"):
+        content_bytes, ctype = fetch_url(args.target, args.allow_local)
+        is_html = ctype.startswith("text/html")
+    elif parsed_url.scheme == "file":
+        eprint("watchdiff: file:// URLs are not allowed")
+        sys.exit(2)
+    elif "://" in args.target:
+        eprint(f"watchdiff: unsupported URL scheme: {parsed_url.scheme}")
+        sys.exit(2)
+    else:
+        content_bytes = read_local_file(args.target)
+        is_html = args.target.endswith((".html", ".htm"))
+
+    lines = process_content(content_bytes, is_html, args.text)
+    norm_lines = apply_ignores_and_volatiles(lines, ignore_patterns)
+    sha = compute_hash(norm_lines)
+
+    state = load_state(state_path)
+    if not state:
+        save_state(state_path, norm_lines, sha)
+        print(f"watchdiff: baseline saved ({len(norm_lines)} lines)")
+        sys.exit(0)
+
+    if sha == state.get("sha256"):
+        fetched = state.get("fetched_at", "unknown")
+        print(f"watchdiff: no change since {fetched}")
+        sys.exit(0)
+
+    out_lines, summary = diff_output(state.get("lines", []), norm_lines, args.max, args.set)
+    for l in out_lines:
+        print(l)
+    print(summary)
+
+    save_state(state_path, norm_lines, sha)
+    sys.exit(3)
+
+if __name__ == "__main__":
+    main()

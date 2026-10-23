@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""promptlint - catch bloated or leaky prompts BEFORE you send them to an AI.
+
+usage: promptlint [FILE|-] [--budget TOKENS] [--json] [--fix OUT] [--quiet]
+
+Checks (severity, line, message, est. tokens wasted):
+  dup-line     exact / near-duplicate instruction lines (difflib ratio >= 0.9, > 30 chars)
+  dup-para     repeated paragraphs
+  big-block    pasted blocks > 1500 chars (fenced code or non-prose) - reference a path or summarize
+  filler       filler phrases ("please make sure to", "it is very important that", ...)
+  secret  HIGH secrets (sk-, ghp_, nsec1, AKIA, api_key=...) - never printed, shown as [REDACTED]
+  blob    HIGH long base64/hex blobs (> 200 chars)
+  budget  HIGH estimated tokens over --budget (default 4000)
+Token estimate: ~chars/3.4 prose, chars/3.0 code/JSON (no tokenizer needed; measured 2-12% above o200k_base, i.e. conservative).
+
+--fix OUT  write a copy with exact duplicate lines/paragraphs and filler phrases removed
+           (code blocks untouched; secrets replaced by [REDACTED]); prints the new estimate.
+           OUT must not already exist unless --force.
+Exit: 0 clean/low findings, 1 any HIGH finding or over budget, 2 usage/read error.
+
+examples:
+  promptlint prompt.md
+  cat big_prompt.txt | promptlint - --budget 2000
+  promptlint prompt.md --fix prompt.lean.md
+"""
+import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
+import sys, re, json, os, argparse, difflib
+
+SECRET = re.compile(
+    r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|nsec1[02-9ac-hj-np-z]{50,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|(?i:(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|authorization|bearer)\s*[:=]\s*['\"]?[A-Za-z0-9._~+/-]{8,})")
+BLOB = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
+FILLERS = ["please make sure to", "please make sure that", "make sure to", "it is very important that",
+           "it is important that", "it is crucial that", "as an ai", "as an ai language model", "i want you to",
+           "basically", "in order to", "please note that", "note that", "feel free to", "i would like you to",
+           "you are a helpful assistant", "if you don't mind", "very very",
+           "at the end of the day", "needless to say", "kindly"]
+FILLERS = sorted(set(FILLERS), key=len, reverse=True)
+FILL_RE = re.compile(r"\b(" + "|".join(re.escape(f) for f in FILLERS) + r")\b[ ,]*", re.I)
+CODEISH = re.compile(r"[{};,]\s*$|^\s*[{}\[\]]|\w\s*=\s*[\"'\d\[{(]|^\s{4,}\S|^\s*[\"']\w+[\"']\s*:|^\s*<\w")
+
+def est(text, code=False):
+    return int(round(len(text) / (3.0 if code else 3.4)))
+
+def est_mixed(text):
+    t = 0
+    for blk, is_code in split_fences(text):
+        t += est(blk, is_code)
+    return t
+
+def split_fences(text):
+    out, cur, code = [], [], False
+    for ln in text.splitlines(keepends=True):
+        if ln.lstrip().startswith("```"):
+            if not code:
+                if cur: out.append(("".join(cur), False)); cur = []
+                cur.append(ln); code = True
+            else:
+                cur.append(ln); out.append(("".join(cur), True)); cur = []; code = False
+            continue
+        cur.append(ln)
+    if cur: out.append(("".join(cur), code))
+    return out
+
+def norm(s):
+    return re.sub(r"[\W_]+", " ", s.lower()).strip()
+
+def lint(text, budget):
+    F = []
+    def add(sev, line, kind, msg, waste=0): F.append({"severity": sev, "line": line, "kind": kind, "message": msg, "wasted": waste})
+    lines = text.splitlines()
+    in_code = [False] * len(lines); c = False
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("```"):
+            in_code[i] = True; c = not c; continue
+        in_code[i] = c
+    # secrets / blobs (everywhere, code included)
+    for i, ln in enumerate(lines, 1):
+        for m in SECRET.finditer(ln):
+            kind = m.group(0).split("=")[0].split(":")[0][:12] if "=" in m.group(0) or ":" in m.group(0) else m.group(0)[:4]
+            add("HIGH", i, "secret", f"secret-looking value ({re.sub(r'[A-Za-z0-9]{3,}$', '', kind)}...) -> [REDACTED]; remove it before sending")
+        for m in BLOB.finditer(ln):
+            add("HIGH", i, "blob", f"{len(m.group(0))}-char base64/hex blob; replace with a file path or hash", est(m.group(0), True))
+    # duplicate lines (prose only)
+    seen = {}; prev = []
+    for i, ln in enumerate(lines, 1):
+        if in_code[i - 1]: continue
+        n = norm(ln)
+        if len(n) < 12: continue
+        if n in seen:
+            add("MED", i, "dup-line", f"duplicate of line {seen[n]}: \"{SECRET.sub('[REDACTED]', ln.strip())[:60]}\"", est(ln))
+            continue
+        seen[n] = i
+        if len(n) > 30:
+            for pj, pn in prev[-200:]:
+                if abs(len(pn) - len(n)) < 0.2 * len(n) and difflib.SequenceMatcher(None, pn, n).ratio() >= 0.9:
+                    add("LOW", i, "near-dup", f"near-duplicate of line {pj}", est(ln)); break
+            prev.append((i, n))
+    # duplicate paragraphs
+    paras, start, buf = [], 1, []
+    for i, ln in enumerate(lines + [""], 1):
+        if ln.strip() == "":
+            if buf: paras.append((start, "\n".join(buf)))
+            buf = []; start = i + 1
+        else:
+            buf.append(ln)
+    pseen = {}
+    for st, p in paras:
+        n = norm(p)
+        if "\n" in p and len(n) > 40:
+            if n in pseen:
+                add("MED", st, "dup-para", f"paragraph repeats the one at line {pseen[n]}", est(p))
+            else:
+                pseen[n] = st
+    # big blocks
+    lineno = 1
+    for blk, is_code in split_fences(text):
+        if is_code and len(blk) > 1500:
+            add("MED", lineno, "big-block", f"fenced block of {len(blk)} chars (~{est(blk, True)} tok); pass a path / excerpt instead", est(blk, True) // 2)
+        elif not is_code:
+            run, rstart, rl = [], 0, lineno
+            for j, ln in enumerate(blk.splitlines(), lineno):
+                if ln.strip() and CODEISH.search(ln):
+                    if not run: rstart = j
+                    run.append(ln)
+                else:
+                    if sum(map(len, run)) > 1500:
+                        s = "\n".join(run); add("MED", rstart, "big-block", f"pasted data/code block of {len(s)} chars (~{est(s, True)} tok)", est(s, True) // 2)
+                    run = []
+            if sum(map(len, run)) > 1500:
+                s = "\n".join(run); add("MED", rstart, "big-block", f"pasted data/code block of {len(s)} chars (~{est(s, True)} tok)", est(s, True) // 2)
+        lineno += blk.count("\n")
+    # fillers
+    counts, first = {}, {}
+    for i, ln in enumerate(lines, 1):
+        if in_code[i - 1]: continue
+        for m in FILL_RE.finditer(ln):
+            k = m.group(1).lower(); counts[k] = counts.get(k, 0) + 1; first.setdefault(k, i)
+    for k, n in sorted(counts.items(), key=lambda x: -x[1]):
+        add("LOW", first[k], "filler", f"filler \"{k}\" x{n}", est(k + " ") * n)
+    total = est_mixed(text)
+    if total > budget:
+        add("HIGH", 0, "budget", f"~{total} tokens est > budget {budget} (over by {total - budget})", total - budget)
+    F.sort(key=lambda f: ({"HIGH": 0, "MED": 1, "LOW": 2}[f["severity"]], f["line"]))
+    return F, total
+
+def fix(text):
+    out, seen_lines, seen_paras = [], set(), set()
+    for blk, is_code in split_fences(text):
+        if is_code:
+            out.append(SECRET.sub("[REDACTED]", blk)); continue
+        paras = re.split(r"(\n\s*\n)", blk)
+        for p in paras:
+            if not p.strip():
+                out.append(p); continue
+            n = norm(p)
+            if "\n" in p.strip() and len(n) > 40:
+                if n in seen_paras: continue
+                seen_paras.add(n)
+            kept = []
+            for ln in p.split("\n"):
+                nl = norm(ln)
+                if len(nl) >= 12 and nl in seen_lines: continue
+                if len(nl) >= 12: seen_lines.add(nl)
+                new = FILL_RE.sub("", ln)
+                if new != ln:
+                    new = re.sub(r"^(\s*(?:[-*]|\d+\.)?\s*)([a-z])", lambda m: m.group(1) + m.group(2).upper(), new)
+                kept.append(new)
+            out.append("\n".join(kept))
+    s = "".join(out)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return SECRET.sub("[REDACTED]", s)
+
+def main():
+    ap = argparse.ArgumentParser(prog="promptlint", add_help=False)
+    ap.add_argument("file", nargs="?", default="-")
+    ap.add_argument("--budget", type=int, default=4000)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--fix")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    try:
+        a = ap.parse_args()
+    except SystemExit:
+        sys.exit(2)
+    if a.help:
+        print(__doc__); return 0
+    try:
+        text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        print(f"promptlint: cannot read {a.file}: {e.strerror}", file=sys.stderr); return 2
+    F, total = lint(text, a.budget)
+    wasted = sum(f["wasted"] for f in F if f["kind"] != "budget")
+    pct = 100 * wasted / total if total else 0
+    rc = 1 if any(f["severity"] == "HIGH" for f in F) else 0
+    if a.json:
+        print(json.dumps({"tokens_est": total, "wasted_est": wasted, "wasted_pct": round(pct, 1), "findings": F}, indent=1))
+    else:
+        if not a.quiet:
+            for f in F:
+                print(f"{f['severity']:4} L{f['line']:<4} {f['kind']:9} {f['message']}" + (f"  (~{f['wasted']} tok)" if f["wasted"] else ""))
+        print(f"promptlint: {total} tokens est, {wasted} wasted est ({pct:.0f}%), {len(F)} findings")
+    if a.fix:
+        if os.path.exists(a.fix) and not a.force:
+            print(f"promptlint: {a.fix} exists (use --force)", file=sys.stderr); return 2
+        new = fix(text)
+        with open(a.fix, "w", encoding="utf-8") as fh:
+            fh.write(new)
+        nt = est_mixed(new)
+        print(f"promptlint: fixed copy -> {a.fix}: {total} -> {nt} tokens est (-{100*(total-nt)/max(total,1):.0f}%)", file=sys.stderr)
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
