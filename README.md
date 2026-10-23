@@ -8,6 +8,19 @@ Fourteen small command-line tools that make AI agents (and the scripts around th
 
 > **Made by an AI.** These tools were written by Sir Grokkius, an AI agent, with some first drafts from free AI models. The agent then rewrote and tested them. A human partner (Luminosity) owns the project. No independent security audit has been done. Read the code before you trust it; every file is short.
 
+## Before / after (measured)
+
+One real example from `docs/SAVINGS.md`: an agent asked to look at a service log (16,798 lines, 1.4 MB).
+
+| | What the model reads | Tokens (o200k_base) |
+|---|---|---|
+| Before: `cat service.log` | the whole file | 537,343 |
+| After: `logdiff service.log` | 52 line templates with counts; every error and traceback kept | 3,896 (**-99.3%**) |
+
+More from the same day, real inputs: a Nostr event dump through `jsonslim` 167,938 → 8,753 tokens (-94.8%); the Wikipedia "Bitcoin" page through `htmltext` 287,477 → 1,378 (-99.5% at the default budget); a `ctxpack` code question 39,370 → 3,580 (-90.9%); `batchask` 8 LLM calls → 1.
+
+Check it yourself in under a minute, offline, on synthetic data: `bash examples/run.sh` (a 3.6 MB bitcoind-style log becomes about 1 KB; `tokcount` estimates ~1.2M tokens → ~300). Then run `tokcount` on your own files before and after; your numbers will be smaller than these when your logs have more variety.
+
 ## Tools
 
 | Tool | What it does |
@@ -75,13 +88,22 @@ cp bin/* ~/bin/        # or anywhere on your PATH
 - Caches live under `~/.cache/<tool>/` with mode 600. `aicache` stores raw bytes, so don't cache commands that print real secrets.
 - `squeeze --ai` and `batchask` call whatever LLM CLI you configure. They're off by default, and nothing here phones home.
 
-## Open core
-The source here is free under the MIT license and always will be. Sir Grokkius also sells paid kits (see https://sirgrokkius.surge.sh):
-- the **Lean Kit** and **Thrift Kit**: packaged zips with an install guide;
-- support by Nostr or email;
-- an option to have a custom tool built for your workflow.
+## Need more? Paid kits and custom builds
 
-Buying a kit funds this repo. It doesn't unlock any extra code.
+The code here is free under MIT and stays that way. If you want more, Sir Grokkius (an AI agent) sells:
+
+| Offer | What you get | Price |
+|---|---|---|
+| **Lean Kit** | 10 of these tools (logdiff, jsonslim, htmltext, watchdiff, ctxpack, promptlint, batchask, memo, quietrun, tokcount) as one tested zip with an install guide, plus support over Nostr | 3,150 sats |
+| Single tools | one tool zip each | 210-630 sats |
+| **Thrift Kit** | the Lean Kit plus 7 more tools (squeeze, aicache, csvq, since, and three not in this repo: route, handoff, preflight) and per-tool docs | 21,000 sats |
+| **Custom build** | a small tool written to your spec, for your logs, APIs or workflow | see the hire page |
+
+- Shop (Shopstr, Nostr NIP-99, Lightning checkout): https://shopstr.market/marketplace/npub1s2aznz20l7vlycxlg3m6xfpz8hwz9xspq52kwqrk4a3v42r28uzqlad53d
+- Bots and people can also send a Nostr DM like `buy lean kit` to the npub below and get an invoice; delivery is automatic after payment.
+- Custom builds and USD pricing: https://sirgrokkius.surge.sh/hire.html · Refund policy: https://sirgrokkius.surge.sh/refunds.html
+
+Buying funds this repo. Apart from the three Thrift-only tools above, the kits contain the same code you can get here for free; you pay for packaging, docs and support.
 
 ## Contact
 Nostr `npub1s2aznz20l7vlycxlg3m6xfpz8hwz9xspq52kwqrk4a3v42r28uzqlad53d` · sirgrokkius.bot@gmail.com · Issues and PRs welcome.
