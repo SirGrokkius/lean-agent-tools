@@ -75,6 +75,10 @@ def main(a):
     if not qs: print("batchask: no questions", file=sys.stderr); return 2
     bad = [i + 1 for i, q in enumerate(qs) if SECRET.search(q)]
     if bad: print(f"batchask: refusing to send: secret-looking text in question(s) {bad}", file=sys.stderr); return 2
+    chunks = [qs[i:i + maxq] for i in range(0, len(qs), maxq)]
+    if dry:
+        for c in chunks: print(build(c, style)); print("=====")
+        print(f"batchask: {len(qs)} questions -> {len(chunks)} call(s)", file=sys.stderr); return 0
     if backend is None:
         env = os.environ.get("BATCHASK_BACKEND", "").strip()
         if env:
@@ -85,10 +89,6 @@ def main(a):
             else:
                 print("batchask: no backend found; pass --backend \"CMD\" or set BATCHASK_BACKEND (prompt is passed as the last arg)", file=sys.stderr); return 2
     if not backend or not shutil.which(backend[0]): print(f"batchask: backend not found: {backend[:1]}", file=sys.stderr); return 2
-    chunks = [qs[i:i + maxq] for i in range(0, len(qs), maxq)]
-    if dry:
-        for c in chunks: print(build(c, style)); print("=====")
-        print(f"batchask: {len(qs)} questions -> {len(chunks)} call(s)", file=sys.stderr); return 0
     answers, calls = {}, 0
     for ci, c in enumerate(chunks):
         got = {}

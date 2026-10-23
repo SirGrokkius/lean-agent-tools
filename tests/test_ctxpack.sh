@@ -22,4 +22,17 @@ ok "no hits rc1" "[ \$($T 'zzqqxx' $W >/dev/null 2>&1; echo \$?) -eq 1 ]"
 ok "missing dir rc2" "[ \$($T 'x' /nonexistent >/dev/null 2>&1; echo \$?) -eq 2 ]"
 ok "--terms override" "$T --terms other $W --list | grep -q limits.py"
 ok "query with shell metachar is literal" "$T '\$(touch $W/pwned) ; rm -rf' $W >/dev/null 2>&1; [ ! -e $W/pwned ]"
+# same core checks with the stdlib fallback engine (used when rg is not installed, e.g. bare CI runners)
+PY="env CTXPACK_ENGINE=python $T"
+B=$(mktemp); mv $W/src/big.txt $B   # same fixture state as the rg checks above
+ok "py: list ranks limits.py first" "$PY 'where is the tier1 daily cap' $W --list | sed -n 2p | grep -q limits.py"
+O=$($PY 'where is the tier1 daily cap' $W --cap 500)
+ok "py: snippet has path:line" "grep -q 'limits.py:1-' <<<\"\$O\""
+ok "py: .env never read" "! grep -q 'sk-abc' <<<\"\$O\" && ! grep -q '\.env' <<<\"\$O\""
+ok "py: .bak skipped" "! grep -q 'limits.py.bak' <<<\"\$O\""
+ok "py: secret value redacted" "grep -q REDACTED <<<\"\$O\" && ! grep -q abcdef123456 <<<\"\$O\""
+mv $B $W/src/big.txt
+ok "py: respects cap" "[ \$($PY 'tier1 cap' $W --cap 300 | wc -c) -lt 1700 ]"
+ok "py: no hits rc1" "[ \$($PY 'zzqqxx' $W >/dev/null 2>&1; echo \$?) -eq 1 ]"
+ok "py: --glob filter" "! $PY 'tier1 cap' $W --glob '*.py' --list | grep -q noise.txt && $PY 'tier1 cap' $W --glob '*.py' --list | grep -q limits.py"
 done_

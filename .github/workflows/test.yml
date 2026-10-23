@@ -11,5 +11,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: install ripgrep (ctxpack's fast engine; its stdlib fallback is tested too)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
       - run: bash tests/run-all.sh
       - run: bash examples/run.sh

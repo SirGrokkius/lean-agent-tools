@@ -17,7 +17,9 @@ Each term is searched with ripgrep (fixed-string, case-insensitive, respects .gi
 File score = sum over terms of log-damped hits x IDF(term) + bonus for a term in the path.
 Snippets = merged hit windows, best windows first, each tagged 'path:start-end'.
 Secret-looking strings are redacted; .env*, *.pem, *.key, id_rsa*, *vault*, *secret* files are never read.
-Needs: rg (ripgrep) on PATH. No AI, no network.
+Uses rg (ripgrep) when on PATH; otherwise a pure-Python fallback with the same deny list
+(skips hidden files/dirs, binaries, files > 2M; honours --glob; does not parse .gitignore).
+Force the fallback with CTXPACK_ENGINE=python. No AI, no network.
 
 Examples:
   ctxpack "where is the retry limit enforced" ./src --cap 2000
@@ -25,7 +27,7 @@ Examples:
 Exit codes: 0 ok, 1 no hits, 2 usage/error.
 """
 import signal as _sig; _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)  # quiet on `| head`
-import sys, os, re, math, subprocess, shutil, collections
+import sys, os, re, math, subprocess, shutil, collections, fnmatch
 
 SECRET = re.compile(r"(nsec1[0-9a-z]{20,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|(?i:(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+)|\b[A-Fa-f0-9]{40,}\b|(?<![/\w.-])(?=[A-Za-z0-9_+-]*\d)(?=[A-Za-z0-9_+-]*[A-Za-z])[A-Za-z0-9_+-]{40,}={0,2}(?![/\w.]))")
 def redact(s): return SECRET.sub("[REDACTED]", s)
@@ -56,6 +58,39 @@ def rg_count(term, paths, globs):
         if p and n.isdigit() and not DENY_RE.search(p): out[p] = int(n)
     return out
 
+MAXSIZE = 2 * 1024 * 1024
+def _glob_ok(rel, globs):
+    """rg-like --glob semantics: path must match any positive glob (if any) and no '!' glob."""
+    name = os.path.basename(rel); pos = [g for g in globs if not g.startswith("!")]
+    def m(g):
+        g = g.rstrip("/")
+        return fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(name, g) or any(fnmatch.fnmatch(part, g) for part in rel.split("/")[:-1])
+    if any(m(g[1:]) for g in globs if g.startswith("!")): return False
+    return not pos or any(m(g) for g in pos)
+
+def _walk(paths, globs):
+    for root in paths:
+        if os.path.isfile(root): yield root; continue
+        for d, subs, files in os.walk(root):
+            subs[:] = sorted(x for x in subs if not x.startswith(".") and _glob_ok(os.path.relpath(os.path.join(d, x), root) + "/", DENY))
+            for f in sorted(files):
+                if f.startswith("."): continue
+                fp = os.path.join(d, f); rel = os.path.relpath(fp, root)
+                if _glob_ok(rel, DENY + globs) and os.path.isfile(fp): yield fp
+
+def py_count(term, paths, globs):
+    out, tl = {}, term.lower()
+    for fp in _walk(paths, globs):
+        if DENY_RE.search(fp): continue
+        try:
+            if os.path.getsize(fp) > MAXSIZE: continue
+            with open(fp, "rb") as f: data = f.read()
+        except OSError: continue
+        if b"\0" in data[:8192]: continue                       # binary, like rg
+        n = data.decode("utf-8", "replace").lower().count(tl)
+        if n: out[fp] = n
+    return out
+
 def main(a):
     q, dirs, cap, ctx, globs, maxf, lst, fixed = None, [], 3000, 3, [], 12, False, None
     while a:
@@ -72,13 +107,13 @@ def main(a):
         else: dirs.append(x)
     if fixed and q is not None and os.path.exists(q): dirs.insert(0, q); q = None   # --terms given: positionals are paths
     if q is None and not fixed: print(__doc__); return 2
-    if not shutil.which("rg"): print("ctxpack: needs ripgrep (rg) on PATH", file=sys.stderr); return 2
+    use_rg = shutil.which("rg") and os.environ.get("CTXPACK_ENGINE", "").lower() != "python"
     dirs = dirs or ["."]
     for d in dirs:
         if not os.path.exists(d): print(f"ctxpack: no such path {d}", file=sys.stderr); return 2
     terms = fixed or terms_from(q)
     if not terms: print("ctxpack: no usable search terms", file=sys.stderr); return 2
-    hits = {t: rg_count(t, dirs, globs) for t in terms}
+    hits = {t: (rg_count if use_rg else py_count)(t, dirs, globs) for t in terms}
     allf = set().union(*[set(h) for h in hits.values()])
     if not allf: print(f"ctxpack: no hits for {terms}", file=sys.stderr); return 1
     N = len(allf)
